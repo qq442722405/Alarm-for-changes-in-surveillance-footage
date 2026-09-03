@@ -160,8 +160,8 @@ class RegionOverlay(QWidget):
             for pt in r.points:
                 poly.append(QPoint(pt[0] - mon['left'], pt[1] - mon['top']))
 
-            # 只显示边框：默认绿色，报警后 2.5 秒内保持红色
-            is_alarm = (now - r.last_event) < 2.5
+            # 只显示边框：默认绿色，报警后 2 秒内保持红色
+            is_alarm = (now - r.last_event) < 2.0
             color = Qt.red if is_alarm else Qt.green
 
             p.setBrush(Qt.NoBrush)          # 无颜色填充，仅保留外框
@@ -537,28 +537,37 @@ class MainWindow(QMainWindow):
         if not r.motion:
             return False
             
+        # 转换至 CIELab 空间，并使用更大的高斯模糊滤波（7x7），消除屏幕微小噪点
         lab = cv2.cvtColor(frame, cv2.COLOR_BGR2Lab)
-        lab = cv2.GaussianBlur(lab, (5, 5), 0)
+        lab = cv2.GaussianBlur(lab, (7, 7), 0)
         
         if r.last_lab is None or r.last_lab.shape != lab.shape:
             r.last_lab = lab
             return False
 
+        # 计算相邻帧色差
         diff = cv2.absdiff(r.last_lab, lab)
         diff_max = np.max(diff, axis=2)
-        r.last_lab = lab
+        r.last_lab = lab  # 实时更新基准帧：画面变化后下一帧若静止，差值将立刻降至0
 
+        # 生成选区 Mask
         mask = np.zeros((r.h, r.w), dtype=np.uint8)
         cv2.fillPoly(mask, [r.rel_points], 255)
 
+        # 【关键修复】内缩 Mask 避开最外侧 9px 的边框绘制区域，彻底隔离 RegionOverlay 变红/变绿引发的自激循环
+        kernel_erode = np.ones((9, 9), np.uint8)
+        mask_eroded = cv2.erode(mask, kernel_erode)
+        if np.count_nonzero(mask_eroded) > 0:
+            mask = mask_eroded
+
         diff_masked = cv2.bitwise_and(diff_max, diff_max, mask=mask)
 
-        threshold = max(6, int(45 - r.sensitivity * 0.35))
+        # 动态二值化与形态学过滤
+        threshold = max(10, int(45 - r.sensitivity * 0.35))
         _, th = cv2.threshold(diff_masked, threshold, 255, cv2.THRESH_BINARY)
         
-        kernel = np.ones((3, 3), np.uint8)
-        th = cv2.morphologyEx(th, cv2.MORPH_OPEN, kernel)
-        th = cv2.dilate(th, kernel, iterations=2)
+        kernel_morph = np.ones((3, 3), np.uint8)
+        th = cv2.morphologyEx(th, cv2.MORPH_OPEN, kernel_morph)
 
         mask_pixels = np.count_nonzero(mask)
         if mask_pixels == 0:
@@ -582,7 +591,7 @@ class MainWindow(QMainWindow):
         self.alarm.play()
         stamp = datetime.now().strftime("%H:%M:%S")
         self.status.setText(f"状态：[{stamp}] {r.name} 触发报警！")
-        self.update_region_overlay()  # 立即刷新边框变成红色
+        self.update_region_overlay()  # 仅改变边框样式，内缩 Mask 确保不会引发自我触发
 
         if r.auto_pause:
             self.running = False
@@ -601,8 +610,8 @@ class MainWindow(QMainWindow):
             if not r.enabled:
                 continue
 
-            # 如果处于报警红框维持时间内，持续刷新以确保红转绿过度及时
-            if now - r.last_event < 3.0:
+            # 在报警后 2.5 秒内保持高亮红框，超时后切回绿框
+            if now - r.last_event < 2.5:
                 need_overlay_refresh = True
 
             frame = self.get_crop(r)
@@ -611,6 +620,7 @@ class MainWindow(QMainWindow):
 
             motion = self.detect_motion(frame, r)
 
+            # 画面有变化时才增加确认计数，一旦无变化（motion=False）立刻清零计数，停止报警判定
             if motion:
                 r.confirm_count += 1
             else:
