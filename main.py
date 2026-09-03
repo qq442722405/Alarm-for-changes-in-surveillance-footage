@@ -1,4 +1,4 @@
-import sys, json, time, csv, os, traceback, ctypes
+import sys, json, time, os, traceback, ctypes
 from pathlib import Path
 from datetime import datetime
 
@@ -9,7 +9,7 @@ def resource_path(relative_path):
         return Path(sys._MEIPASS) / relative_path
     return Path(__file__).parent / relative_path
 
-# ==================== 2. 全局异常捕获 (避免闪退无响应) ====================
+# ==================== 2. 全局异常捕获 ====================
 def handle_exception(exc_type, exc_value, exc_traceback):
     """捕获未处理的异常，弹出对话框并保存日志"""
     err_msg = "".join(traceback.format_exception(exc_type, exc_value, exc_traceback))
@@ -45,14 +45,12 @@ from PySide6.QtGui import QImage, QPixmap, QPainter, QPen, QIcon, QPolygon, QCol
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QPushButton, QLabel, QListWidget,
     QListWidgetItem, QVBoxLayout, QHBoxLayout, QFormLayout, QGroupBox,
-    QSpinBox, QDoubleSpinBox, QCheckBox, QMessageBox, QFileDialog,
-    QAbstractItemView
+    QSpinBox, QDoubleSpinBox, QCheckBox, QMessageBox, QAbstractItemView
 )
 
 APP_DIR = Path.home() / ".screen_monitor_ai"
 APP_DIR.mkdir(parents=True, exist_ok=True)
 CONFIG_FILE = APP_DIR / "regions.json"
-EVENT_FILE = APP_DIR / "events.csv"
 SNAP_DIR = APP_DIR / "snapshots"
 SNAP_DIR.mkdir(exist_ok=True)
 
@@ -161,12 +159,10 @@ class RegionOverlay(QWidget):
             for pt in r.points:
                 poly.append(QPoint(pt[0] - mon['left'], pt[1] - mon['top']))
 
-            # 填充半透明红色
             p.setBrush(QColor(255, 0, 0, 40))
             p.setPen(QPen(Qt.red, 3))
             p.drawPolygon(poly)
 
-            # 绘制标注文字
             top_pt = min([QPoint(pt[0] - mon['left'], pt[1] - mon['top']) for pt in r.points], key=lambda pt: pt.y())
             p.setPen(QPen(Qt.white, 1))
             p.drawText(top_pt + QPoint(6, -6 if top_pt.y() > 20 else 20), f"{i+1}. {r.name}")
@@ -184,7 +180,6 @@ class Region:
         self.cooldown = int(d.get("cooldown", 10))
         self.auto_pause = bool(d.get("auto_pause", False))
         
-        # 存储四点位数据 [[x1, y1], [x2, y2], [x3, y3], [x4, y4]]
         self.points = d.get("points", [])
         if not self.points and "x" in d:
             x, y, w, h = d.get("x", 0), d.get("y", 0), d.get("w", 300), d.get("h", 200)
@@ -196,7 +191,6 @@ class Region:
         self._update_bounds()
 
     def _update_bounds(self):
-        """计算四点位的外接最小矩形，用于局域截图"""
         if len(self.points) >= 4:
             xs = [pt[0] for pt in self.points]
             ys = [pt[1] for pt in self.points]
@@ -204,7 +198,6 @@ class Region:
             self.y = min(ys)
             self.w = max(10, max(xs) - self.x)
             self.h = max(10, max(ys) - self.y)
-            # 转换为相对于截图左上角的相对坐标
             self.rel_points = np.array([[pt[0] - self.x, pt[1] - self.y] for pt in self.points], dtype=np.int32)
         else:
             self.x, self.y, self.w, self.h = 0, 0, 100, 100
@@ -236,16 +229,15 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
-        self.resize(1120, 720)
+        self.resize(960, 600)
         self.regions = []
-        self.events = []
         self.running = False
         self.selected_index = -1
         self.sct = mss.mss()
         self.alarm = Alarm()
         self.region_overlay = RegionOverlay(self)
         self._build_ui()
-        self.load_config(silent=True)
+        self.auto_load_config()
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.tick)
@@ -258,54 +250,45 @@ class MainWindow(QMainWindow):
 
         left = QVBoxLayout()
         title = QLabel("屏幕监控智能报警")
-        title.setStyleSheet("font-size:24px;font-weight:bold;")
+        title.setStyleSheet("font-size:22px;font-weight:bold;")
         left.addWidget(title)
 
-        tip = QLabel(
-            "说明：程序监控 Windows 实际屏幕画面。\n"
-            "点击“四点框选屏幕”后，在屏幕上依次点击 4 个点确定监控多边形。"
-        )
+        tip = QLabel("说明：点击“四点框选屏幕”在屏幕上顺次点击 4 个点建立监控区域。")
         tip.setWordWrap(True)
         left.addWidget(tip)
 
-        buttons = QHBoxLayout()
+        # 第一排功能按钮
+        btn_layout_1 = QHBoxLayout()
         self.select_btn = QPushButton("四点框选屏幕")
+        self.del_btn = QPushButton("删除区域")
+        self.test_btn = QPushButton("测试报警")
+        btn_layout_1.addWidget(self.select_btn)
+        btn_layout_1.addWidget(self.del_btn)
+        btn_layout_1.addWidget(self.test_btn)
+        left.addLayout(btn_layout_1)
+
+        # 第二排监控控制按钮
+        btn_layout_2 = QHBoxLayout()
         self.start_btn = QPushButton("开始监控")
         self.pause_btn = QPushButton("暂停")
-        self.test_btn = QPushButton("测试报警")
-        buttons.addWidget(self.select_btn)
-        buttons.addWidget(self.start_btn)
-        buttons.addWidget(self.pause_btn)
-        buttons.addWidget(self.test_btn)
-        left.addLayout(buttons)
+        self.show_regions_cb = QCheckBox("显示框选区域")
+        btn_layout_2.addWidget(self.start_btn)
+        btn_layout_2.addWidget(self.pause_btn)
+        btn_layout_2.addWidget(self.show_regions_cb)
+        left.addLayout(btn_layout_2)
 
         self.select_btn.clicked.connect(self.select_region)
+        self.del_btn.clicked.connect(self.delete_region)
+        self.test_btn.clicked.connect(self.test_alarm)
         self.start_btn.clicked.connect(self.toggle_monitor)
         self.pause_btn.clicked.connect(self.toggle_pause)
-        self.test_btn.clicked.connect(self.test_alarm)
-
-        self.show_regions_cb = QCheckBox("显示框选区域")
-        self.show_regions_cb.setChecked(False)
         self.show_regions_cb.stateChanged.connect(self.toggle_region_overlay)
-        buttons.addWidget(self.show_regions_cb)
 
         self.list = QListWidget()
         self.list.setSelectionMode(QAbstractItemView.SingleSelection)
         self.list.currentRowChanged.connect(self.region_changed)
         left.addWidget(QLabel("监控区域列表"))
         left.addWidget(self.list)
-
-        manage = QHBoxLayout()
-        for text, fn in [
-            ("删除区域", self.delete_region),
-            ("保存配置", self.save_config),
-            ("加载配置", lambda: self.load_config(False)),
-            ("导出事件CSV", self.export_csv),
-        ]:
-            b = QPushButton(text)
-            b.clicked.connect(fn)
-            manage.addWidget(b)
-        left.addLayout(manage)
 
         right = QVBoxLayout()
         self.form_box = QGroupBox("当前区域参数设置")
@@ -354,13 +337,10 @@ class MainWindow(QMainWindow):
 
         right.addWidget(self.form_box)
 
-        right.addWidget(QLabel("报警事件日志"))
-        self.event_list = QListWidget()
-        right.addWidget(self.event_list)
-
         self.status = QLabel("状态：未监控")
-        self.status.setStyleSheet("font-size:16px;")
+        self.status.setStyleSheet("font-size:16px; font-weight:bold; color: #2c3e50;")
         right.addWidget(self.status)
+        right.addStretch()
 
         main.addLayout(left, 3)
         main.addLayout(right, 2)
@@ -410,11 +390,12 @@ class MainWindow(QMainWindow):
         self.refresh_list()
         self.list.setCurrentRow(len(self.regions)-1)
         self.update_region_overlay()
+        self.auto_save_config()
 
     def refresh_list(self):
         self.list.clear()
         for i, r in enumerate(self.regions):
-            text = f"{i+1}. {r.name}  [4点范围: {r.w}×{r.h}]"
+            text = f"{i+1}. {r.name}  [范围: {r.w}×{r.h}]"
             if not r.enabled:
                 text += "（停用）"
             self.list.addItem(QListWidgetItem(text))
@@ -448,6 +429,7 @@ class MainWindow(QMainWindow):
         self.refresh_list()
         self.list.setCurrentRow(i)
         self.update_region_overlay()
+        self.auto_save_config()
 
     def delete_region(self):
         i = self.selected_index
@@ -456,6 +438,7 @@ class MainWindow(QMainWindow):
             self.selected_index = -1
             self.refresh_list()
             self.update_region_overlay()
+            self.auto_save_config()
 
     def toggle_monitor(self):
         self.running = not self.running
@@ -476,7 +459,7 @@ class MainWindow(QMainWindow):
 
     def test_alarm(self):
         self.alarm.play()
-        QMessageBox.information(self, "测试报警", "已发送 Windows 报警提示音。")
+        QMessageBox.information(self, "测试报警", "已成功触发 Windows 报警提示音。")
 
     def get_crop(self, r):
         mon = self.sct.monitors[0]
@@ -496,7 +479,6 @@ class MainWindow(QMainWindow):
         if not r.motion:
             return False
             
-        # 1. 转换至 CIELab 色彩空间（分离亮度 L 与色度 a, b），解决衣服颜色导致无灰度变化的漏报问题
         lab = cv2.cvtColor(frame, cv2.COLOR_BGR2Lab)
         lab = cv2.GaussianBlur(lab, (5, 5), 0)
         
@@ -504,19 +486,15 @@ class MainWindow(QMainWindow):
             r.last_lab = lab
             return False
 
-        # 2. 计算 L, a, b 三通道的最大变化差值
         diff = cv2.absdiff(r.last_lab, lab)
         diff_max = np.max(diff, axis=2)
         r.last_lab = lab
 
-        # 3. 构造 4 点多边形掩膜
         mask = np.zeros((r.h, r.w), dtype=np.uint8)
         cv2.fillPoly(mask, [r.rel_points], 255)
 
-        # 4. 只针对多边形区域内的像素进行比对
         diff_masked = cv2.bitwise_and(diff_max, diff_max, mask=mask)
 
-        # 5. 二值化与形态学过滤
         threshold = max(6, int(45 - r.sensitivity * 0.35))
         _, th = cv2.threshold(diff_masked, threshold, 255, cv2.THRESH_BINARY)
         
@@ -531,29 +509,27 @@ class MainWindow(QMainWindow):
         ratio = (np.count_nonzero(th) / float(mask_pixels)) * 100.0
         return ratio >= r.min_ratio
 
-    def make_event(self, r, reason, frame):
+    def trigger_alarm(self, r, frame):
         now = time.time()
         if now - r.last_event < r.cooldown:
             return False
         r.last_event = now
 
-        stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        filename = SNAP_DIR / (datetime.now().strftime("%Y%m%d_%H%M%S_%f") + ".jpg")
+        # 后台静默保存报警快照
         try:
+            filename = SNAP_DIR / (datetime.now().strftime("%Y%m%d_%H%M%S_%f") + ".jpg")
             cv2.imwrite(str(filename), frame)
         except Exception:
-            filename = None
+            pass
 
-        self.events.append({
-            "time": stamp, "region": r.name, "reason": reason,
-            "snapshot": str(filename) if filename else ""
-        })
-        self.event_list.insertItem(0, f"{stamp} | {r.name} | {reason}")
         self.alarm.play()
+        stamp = datetime.now().strftime("%H:%M:%S")
+        self.status.setText(f"状态：[{stamp}] {r.name} 触发报警！")
+
         if r.auto_pause:
             self.running = False
             self.start_btn.setText("开始监控")
-            self.status.setText("状态：报警后自动暂停")
+            self.status.setText(f"状态：[{stamp}] {r.name} 触发报警（已自动暂停）")
         return True
 
     def tick(self):
@@ -574,21 +550,21 @@ class MainWindow(QMainWindow):
                 r.confirm_count = 0
 
             if r.confirm_count >= r.confirm:
-                self.make_event(r, "画面发生变化", frame)
+                self.trigger_alarm(r, frame)
                 r.confirm_count = 0
 
-    def save_config(self):
+    def auto_save_config(self):
+        """配置自动保存"""
         try:
             CONFIG_FILE.write_text(
-                json.dumps([r.to_dict() for r in self.regions],
-                           ensure_ascii=False, indent=2),
+                json.dumps([r.to_dict() for r in self.regions], ensure_ascii=False, indent=2),
                 encoding="utf-8"
             )
-            QMessageBox.information(self, "保存成功", "监控区域配置已保存。")
-        except Exception as e:
-            QMessageBox.critical(self, "保存失败", str(e))
+        except Exception:
+            pass
 
-    def load_config(self, silent=False):
+    def auto_load_config(self):
+        """配置自动加载"""
         if not CONFIG_FILE.exists():
             return
         try:
@@ -597,45 +573,15 @@ class MainWindow(QMainWindow):
             self.refresh_list()
             if self.regions:
                 self.list.setCurrentRow(0)
-            if not silent:
-                QMessageBox.information(self, "加载成功", "配置已加载。")
-        except Exception as e:
-            if not silent:
-                QMessageBox.critical(self, "加载失败", str(e))
-
-    def export_csv(self):
-        if not self.events:
-            QMessageBox.information(self, "没有事件", "目前还没有报警事件。")
-            return
-        path, _ = QFileDialog.getSaveFileName(
-            self, "导出事件CSV", "屏幕监控事件.csv", "CSV Files (*.csv)"
-        )
-        if not path:
-            return
-        try:
-            with open(path, "w", newline="", encoding="utf-8-sig") as f:
-                writer = csv.DictWriter(
-                    f, fieldnames=["time", "region", "reason", "snapshot"]
-                )
-                writer.writeheader()
-                writer.writerows(self.events)
-            QMessageBox.information(self, "导出成功", path)
-        except Exception as e:
-            QMessageBox.critical(self, "导出失败", str(e))
+        except Exception:
+            pass
 
     def closeEvent(self, event):
         try:
             self.region_overlay.close()
         except Exception:
             pass
-        try:
-            CONFIG_FILE.write_text(
-                json.dumps([r.to_dict() for r in self.regions],
-                           ensure_ascii=False, indent=2),
-                encoding="utf-8"
-            )
-        except Exception:
-            pass
+        self.auto_save_config()
         event.accept()
 
 
