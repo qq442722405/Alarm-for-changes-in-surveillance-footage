@@ -1,9 +1,0 @@
-__pycache__/
-*.pyc
-.venv/
-venv/
-build/
-dist/
-*.spec
-.screen_monitor_ai/
-yolo11n.pt
