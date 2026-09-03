@@ -26,7 +26,7 @@ def handle_exception(exc_type, exc_value, exc_traceback):
         ctypes.windll.user32.MessageBoxW(
             0,
             f"程序运行发生异常：\n\n{err_msg[:600]}\n\n完整日志已保存至：\n{log_file}",
-            "屏幕监控智能报警 - 错误提示",
+            "监控变化报警 - 错误提示",
             0x10
         )
     except Exception:
@@ -136,7 +136,7 @@ class Selector(QWidget):
 
 
 class RegionOverlay(QWidget):
-    """在桌面上实时渲染已框选的四点位边框（无填充，默认绿色，报警时变红，鼠标穿透）"""
+    """在桌面上实时渲染已框选的四点位边框"""
     def __init__(self, owner):
         super().__init__()
         self.owner = owner
@@ -181,7 +181,6 @@ class Region:
         self.enabled = bool(d.get("enabled", True))
         self.motion = bool(d.get("motion", True))
         
-        # 默认灵敏度 100%，默认最小变化面积 4.0%
         self.sensitivity = int(d.get("sensitivity", 100))
         self.min_ratio = float(d.get("min_ratio", 4.0))
         
@@ -229,7 +228,7 @@ class Region:
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("屏幕监控智能报警")
+        self.setWindowTitle("监控变化报警")
         
         icon_path = resource_path("app.ico")
         if icon_path.exists():
@@ -262,7 +261,7 @@ class MainWindow(QMainWindow):
         main_layout = QVBoxLayout(central)
 
         # 标题与说明
-        title = QLabel("屏幕监控智能报警")
+        title = QLabel("监控变化报警")
         title.setStyleSheet("font-size:20px; font-weight:bold;")
         main_layout.addWidget(title)
 
@@ -474,7 +473,6 @@ class MainWindow(QMainWindow):
             self.auto_save_config()
 
     def clear_cache(self):
-        """清理快照与崩溃日志文件"""
         count = 0
         try:
             if SNAP_DIR.exists():
@@ -537,7 +535,6 @@ class MainWindow(QMainWindow):
         if not r.motion:
             return False
             
-        # 转换至 CIELab 空间，并使用更大的高斯模糊滤波（7x7），消除屏幕微小噪点
         lab = cv2.cvtColor(frame, cv2.COLOR_BGR2Lab)
         lab = cv2.GaussianBlur(lab, (7, 7), 0)
         
@@ -545,16 +542,14 @@ class MainWindow(QMainWindow):
             r.last_lab = lab
             return False
 
-        # 计算相邻帧色差
         diff = cv2.absdiff(r.last_lab, lab)
         diff_max = np.max(diff, axis=2)
-        r.last_lab = lab  # 实时更新基准帧：画面变化后下一帧若静止，差值将立刻降至0
+        r.last_lab = lab
 
-        # 生成选区 Mask
         mask = np.zeros((r.h, r.w), dtype=np.uint8)
         cv2.fillPoly(mask, [r.rel_points], 255)
 
-        # 【关键修复】内缩 Mask 避开最外侧 9px 的边框绘制区域，彻底隔离 RegionOverlay 变红/变绿引发的自激循环
+        # 内缩 Mask 避开外侧 9px，隔离红绿边框切换
         kernel_erode = np.ones((9, 9), np.uint8)
         mask_eroded = cv2.erode(mask, kernel_erode)
         if np.count_nonzero(mask_eroded) > 0:
@@ -562,7 +557,6 @@ class MainWindow(QMainWindow):
 
         diff_masked = cv2.bitwise_and(diff_max, diff_max, mask=mask)
 
-        # 动态二值化与形态学过滤
         threshold = max(10, int(45 - r.sensitivity * 0.35))
         _, th = cv2.threshold(diff_masked, threshold, 255, cv2.THRESH_BINARY)
         
@@ -591,7 +585,7 @@ class MainWindow(QMainWindow):
         self.alarm.play()
         stamp = datetime.now().strftime("%H:%M:%S")
         self.status.setText(f"状态：[{stamp}] {r.name} 触发报警！")
-        self.update_region_overlay()  # 仅改变边框样式，内缩 Mask 确保不会引发自我触发
+        self.update_region_overlay()
 
         if r.auto_pause:
             self.running = False
@@ -610,7 +604,6 @@ class MainWindow(QMainWindow):
             if not r.enabled:
                 continue
 
-            # 在报警后 2.5 秒内保持高亮红框，超时后切回绿框
             if now - r.last_event < 2.5:
                 need_overlay_refresh = True
 
@@ -620,7 +613,6 @@ class MainWindow(QMainWindow):
 
             motion = self.detect_motion(frame, r)
 
-            # 画面有变化时才增加确认计数，一旦无变化（motion=False）立刻清零计数，停止报警判定
             if motion:
                 r.confirm_count += 1
             else:
@@ -634,7 +626,6 @@ class MainWindow(QMainWindow):
             self.update_region_overlay()
 
     def auto_save_config(self):
-        """配置自动保存"""
         try:
             CONFIG_FILE.write_text(
                 json.dumps([r.to_dict() for r in self.regions], ensure_ascii=False, indent=2),
@@ -644,7 +635,6 @@ class MainWindow(QMainWindow):
             pass
 
     def auto_load_config(self):
-        """配置自动加载"""
         if not CONFIG_FILE.exists():
             return
         try:
