@@ -1,32 +1,42 @@
-name: Build Executable
+name: Windows EXE
 
 on:
-  workflow_dispatch:  # 仅保留手动触发按钮
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   build:
     runs-on: windows-latest
-
     steps:
-    - name: Checkout Repository
-      uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.10'
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-    - name: Install Dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install opencv-python mss pyside6 numpy pyinstaller
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-    - name: Build Executable with PyInstaller
-      run: |
-        pyinstaller --noconsole --onefile --name="监控变化报警" main.py
+      - name: Build EXE
+        shell: pwsh
+        run: |
+          pyinstaller --noconfirm --clean --windowed --onefile --icon=app.ico --add-data "app.ico;." --name "屏幕监控智能报警" main.py
 
-    - name: Upload Executable Artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: 监控变化报警-Windows绿色版
-        path: dist/监控变化报警.exe
+      - name: Verify EXE
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "dist/屏幕监控智能报警.exe")) { exit 1 }
+          Get-Item "dist/屏幕监控智能报警.exe"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: 屏幕监控智能报警-Windows
+          path: dist/屏幕监控智能报警.exe
