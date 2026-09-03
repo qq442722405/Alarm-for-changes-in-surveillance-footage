@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.venv/
+build/
+dist/
+*.spec
+snapshots/*.jpg
+models/*.pt

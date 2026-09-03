@@ -1,0 +1,11 @@
+GitHub 在线打包：
+1. 新建 GitHub 仓库。
+2. 上传整个工程。
+3. 进入 Actions。
+4. 选择 Windows EXE。
+5. 点击 Run workflow，或者直接提交代码自动打包。
+6. 打包完成后在 Artifacts 下载“监控回放智能监控-Windows”。
+
+首次使用“人员检测”：
+需要联网下载 YOLO 轻量模型 yolo11n.pt。
+如果暂时不能联网，仍然可以使用“变化检测”功能。
