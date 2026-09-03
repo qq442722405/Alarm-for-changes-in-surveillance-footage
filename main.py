@@ -1,82 +1,104 @@
-import sys
-import json
-import time
-import csv
-import traceback
-import ctypes
-import threading
+import sys, json, time, os, traceback, ctypes
 from pathlib import Path
 from datetime import datetime
 
-
-def resource_path(relative_path: str) -> Path:
-    if hasattr(sys, "_MEIPASS"):
+# ==================== 1. 静态资源与路径处理 ====================
+def resource_path(relative_path):
+    """获取静态资源的绝对路径，兼容 PyInstaller 单文件打包模式与本地开发环境"""
+    if hasattr(sys, '_MEIPASS'):
         return Path(sys._MEIPASS) / relative_path
-    return Path(__file__).resolve().parent / relative_path
+    return Path(__file__).parent / relative_path
 
+# ==================== 2. 全局异常捕获 ====================
+def handle_exception(exc_type, exc_value, exc_traceback):
+    """捕获未处理的异常，弹出对话框并保存日志"""
+    err_msg = "".join(traceback.format_exception(exc_type, exc_value, exc_traceback))
+    
+    log_dir = Path.home() / ".screen_monitor_ai"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / "crash_log.txt"
+    try:
+        log_file.write_text(err_msg, encoding="utf-8")
+    except Exception:
+        pass
+        
+    try:
+        ctypes.windll.user32.MessageBoxW(
+            0,
+            f"程序运行发生异常：\n\n{err_msg[:600]}\n\n完整日志已保存至：\n{log_file}",
+            "监控变化报警 - 错误提示",
+            0x10
+        )
+    except Exception:
+        pass
+
+    sys.__excepthook__(exc_type, exc_value, exc_traceback)
+
+sys.excepthook = handle_exception
+
+# ==================== 3. 核心业务与 YOLO 依赖 ====================
+import cv2
+import mss
+import numpy as np
+from PySide6.QtCore import Qt, QRect, QPoint, QTimer, Signal, QObject
+from PySide6.QtGui import QImage, QPixmap, QPainter, QPen, QIcon, QPolygon, QColor
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QPushButton, QLabel, QComboBox,
+    QVBoxLayout, QHBoxLayout, QFormLayout, QGroupBox, QSpinBox, QDoubleSpinBox,
+    QCheckBox, QMessageBox, QScrollArea, QToolButton, QListWidget, QListWidgetItem, QLineEdit
+)
+
+# 尝试导入 YOLO 框架
+YOLO_AVAILABLE = False
+try:
+    from ultralytics import YOLO
+    YOLO_AVAILABLE = True
+except ImportError:
+    YOLO_AVAILABLE = False
 
 APP_DIR = Path.home() / ".screen_monitor_ai"
 APP_DIR.mkdir(parents=True, exist_ok=True)
 CONFIG_FILE = APP_DIR / "regions.json"
-EVENT_FILE = APP_DIR / "events.csv"
 SNAP_DIR = APP_DIR / "snapshots"
 SNAP_DIR.mkdir(exist_ok=True)
 
 
-def handle_exception(exc_type, exc_value, exc_traceback):
-    if issubclass(exc_type, KeyboardInterrupt):
-        sys.__excepthook__(exc_type, exc_value, exc_traceback)
-        return
-    text = "".join(traceback.format_exception(exc_type, exc_value, exc_traceback))
-    try:
-        (APP_DIR / "crash_log.txt").write_text(text, encoding="utf-8")
-    except Exception:
-        pass
-    try:
-        ctypes.windll.user32.MessageBoxW(
-            0,
-            "程序发生异常。\n\n" + text[:1200] + f"\n\n日志：{APP_DIR / 'crash_log.txt'}",
-            "监控变化报警 - 错误",
-            0x10,
+class CollapsibleBox(QWidget):
+    """通用折叠面板组件"""
+    def __init__(self, title="", parent=None):
+        super().__init__(parent)
+        self.toggle_button = QToolButton()
+        self.toggle_button.setStyleSheet(
+            "QToolButton { border: none; font-weight: bold; font-size: 14px; text-align: left; padding: 6px; background-color: #e8ecef; border-radius: 4px; }"
+            "QToolButton:hover { background-color: #dbe2e8; }"
         )
-    except Exception:
-        pass
-    sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        self.toggle_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.toggle_button.setArrowType(Qt.DownArrow)
+        self.toggle_button.setText(title)
+        self.toggle_button.setCheckable(True)
+        self.toggle_button.setChecked(True)
 
+        self.content_area = QWidget()
+        self.content_layout = QVBoxLayout(self.content_area)
+        self.content_layout.setContentsMargins(4, 4, 4, 4)
 
-sys.excepthook = handle_exception
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(2)
+        lay.addWidget(self.toggle_button)
+        lay.addWidget(self.content_area)
 
-import cv2
-import mss
-import numpy as np
-from PySide6.QtCore import Qt, QRect, QPoint, QTimer, Signal, QObject, QSize
-from PySide6.QtGui import QImage, QPixmap, QPainter, QPen, QIcon, QPolygon, QColor, QFont
-from PySide6.QtWidgets import (
-    QApplication,
-    QMainWindow,
-    QWidget,
-    QPushButton,
-    QLabel,
-    QComboBox,
-    QVBoxLayout,
-    QHBoxLayout,
-    QFormLayout,
-    QGroupBox,
-    QSpinBox,
-    QDoubleSpinBox,
-    QCheckBox,
-    QMessageBox,
-    QProgressBar,
-    QListWidget,
-    QListWidgetItem,
-    QFrame,
-    QScrollArea,
-)
+        self.toggle_button.clicked.connect(self.on_toggle)
 
-try:
-    from ultralytics import YOLO
-except Exception:
-    YOLO = None
+    def on_toggle(self, checked):
+        self.toggle_button.setArrowType(Qt.DownArrow if checked else Qt.RightArrow)
+        self.content_area.setVisible(checked)
+
+    def addLayout(self, layout):
+        self.content_layout.addLayout(layout)
+
+    def addWidget(self, widget):
+        self.content_layout.addWidget(widget)
 
 
 class Alarm(QObject):
@@ -89,54 +111,60 @@ class Alarm(QObject):
 
 
 class Selector(QWidget):
+    """四点位多边形框选窗口"""
     selected = Signal(list)
 
     def __init__(self, image, left, top):
         super().__init__()
-        self.left = left
-        self.top = top
-        self.pixmap = QPixmap.fromImage(image)
+        self.left, self.top = left, top
         self.points = []
-        self.current = QPoint()
+        self.current_pos = QPoint()
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
-        self.setAttribute(Qt.WA_DeleteOnClose, True)
+        self.setAttribute(Qt.WA_TranslucentBackground, False)
         self.setGeometry(left, top, image.width(), image.height())
+        self.pixmap = QPixmap.fromImage(image)
         self.setMouseTracking(True)
-        self.setFocusPolicy(Qt.StrongFocus)
 
     def paintEvent(self, event):
         p = QPainter(self)
         p.drawPixmap(0, 0, self.pixmap)
-        # 只加很轻的遮罩，保证底下监控画面清楚可见
-        p.fillRect(self.rect(), QColor(0, 0, 0, 28))
+        p.setOpacity(0.12)
+        p.fillRect(self.rect(), Qt.black)
+        p.setOpacity(1.0)
         p.setRenderHint(QPainter.Antialiasing)
-        if self.points:
-            poly = QPolygon([QPoint(x - self.left, y - self.top) for x, y in self.points])
-            p.setPen(QPen(QColor("#27d3ff"), 3))
-            p.setBrush(QColor(39, 211, 255, 35))
-            p.drawPolygon(poly)
-            for i, (x, y) in enumerate(self.points):
-                q = QPoint(x - self.left, y - self.top)
-                p.setBrush(QColor("#27d3ff"))
-                p.drawEllipse(q, 6, 6)
-                p.setPen(Qt.white)
-                p.drawText(q + QPoint(9, -9), str(i + 1))
-            p.setPen(QPen(QColor("#ffe66d"), 2, Qt.DashLine))
-            p.drawLine(poly[-1], self.current)
+
+        if len(self.points) > 0:
+            p.setPen(QPen(Qt.green, 3))
+            p.setBrush(Qt.green)
+            for pt in self.points:
+                p.drawEllipse(QPoint(pt[0] - self.left, pt[1] - self.top), 4, 4)
+
+            poly = QPolygon()
+            for pt in self.points:
+                poly.append(QPoint(pt[0] - self.left, pt[1] - self.top))
+
+            if len(self.points) > 1:
+                p.setPen(QPen(Qt.green, 2, Qt.SolidLine))
+                for i in range(len(self.points) - 1):
+                    p.drawLine(poly[i], poly[i+1])
+
+            p.setPen(QPen(Qt.yellow, 2, Qt.DashLine))
+            p.drawLine(poly[-1], self.current_pos)
+
         p.setPen(Qt.white)
-        p.setFont(QFont("Microsoft YaHei", 12, QFont.Bold))
-        p.drawText(30, 42, "四点框选监控区域")
-        p.setFont(QFont("Microsoft YaHei", 10))
-        p.drawText(30, 68, f"左键依次点击 4 个点（{len(self.points)}/4） · 右键重置 · ESC 取消")
+        tip_str = f"请依次在屏幕上点击 4 个点位确定监控区域（已选择 {len(self.points)}/4 点）。按 Esc 取消，右键重置"
+        p.drawText(30, 40, tip_str)
 
     def mouseMoveEvent(self, e):
-        self.current = e.position().toPoint()
+        self.current_pos = e.position().toPoint()
         self.update()
 
     def mousePressEvent(self, e):
         if e.button() == Qt.LeftButton:
             pos = e.position().toPoint()
-            self.points.append([self.left + pos.x(), self.top + pos.y()])
+            abs_x = self.left + pos.x()
+            abs_y = self.top + pos.y()
+            self.points.append([abs_x, abs_y])
             if len(self.points) == 4:
                 self.selected.emit(self.points)
                 self.close()
@@ -152,6 +180,7 @@ class Selector(QWidget):
 
 
 class RegionOverlay(QWidget):
+    """桌面多边形边框渲染 Overlay"""
     def __init__(self, owner):
         super().__init__()
         self.owner = owner
@@ -166,26 +195,25 @@ class RegionOverlay(QWidget):
         p.setRenderHint(QPainter.Antialiasing)
         mon = self.owner.sct.monitors[0]
         now = time.time()
+
         for i, r in enumerate(self.owner.regions):
             if not r.enabled or len(r.points) < 4:
                 continue
-            poly = QPolygon([QPoint(x - mon["left"], y - mon["top"]) for x, y in r.points])
-            alarm = now - r.last_event < 2.2
-            person = r.person_present
-            color = QColor("#ff4d67") if alarm else QColor("#27d3ff")
-            if person and not alarm:
-                color = QColor("#ffb020")
+
+            poly = QPolygon()
+            for pt in r.points:
+                poly.append(QPoint(pt[0] - mon['left'], pt[1] - mon['top']))
+
+            is_alarm = (now - r.last_event) < 2.0
+            color = Qt.red if is_alarm else Qt.green
+
             p.setBrush(Qt.NoBrush)
             p.setPen(QPen(color, 3))
             p.drawPolygon(poly)
-            top = min(poly, key=lambda q: q.y())
-            p.setFont(QFont("Microsoft YaHei", 9, QFont.Bold))
-            label = f"{i + 1}. {r.name}"
-            if person:
-                label += "  人员"
-            label += f"  变化 {r.display_ratio:.2f}%"
-            p.setPen(color)
-            p.drawText(top + QPoint(7, -7 if top.y() > 22 else 20), label)
+
+            top_pt = min([QPoint(pt[0] - mon['left'], pt[1] - mon['top']) for pt in r.points], key=lambda pt: pt.y())
+            p.setPen(QPen(color, 1))
+            p.drawText(top_pt + QPoint(6, -6 if top_pt.y() > 20 else 20), f"{i+1}. {r.name}")
 
 
 class Region:
@@ -194,70 +222,57 @@ class Region:
         self.name = d.get("name", "监控区域")
         self.enabled = bool(d.get("enabled", True))
         self.motion = bool(d.get("motion", True))
-        self.person = bool(d.get("person", True))
-        self.sensitivity = int(d.get("sensitivity", 70))
-        self.min_ratio = float(d.get("min_ratio", 0.35))
-        self.min_blob_ratio = float(d.get("min_blob_ratio", 0.12))
-        self.confirm = int(d.get("confirm", 2))
-        self.cooldown = int(d.get("cooldown", 8))
+        
+        # 画面变化检测参数
+        self.sensitivity = int(d.get("sensitivity", 100))
+        self.min_ratio = float(d.get("min_ratio", 4.0))
+        
+        # YOLO AI 检测参数
+        self.use_ai = bool(d.get("use_ai", False))
+        self.ai_target = str(d.get("ai_target", "person"))
+        self.ai_conf = float(d.get("ai_conf", 0.35))
+
+        self.confirm = int(d.get("confirm", 3))
+        self.cooldown = int(d.get("cooldown", 10))
         self.auto_pause = bool(d.get("auto_pause", False))
-        self.person_conf = float(d.get("person_conf", 0.35))
-        self.person_confirm = int(d.get("person_confirm", 2))
-        self.person_interval = int(d.get("person_interval", 2))
+        
         self.points = d.get("points", [])
         if not self.points and "x" in d:
-            x, y = int(d.get("x", 0)), int(d.get("y", 0))
-            w, h = int(d.get("w", 300)), int(d.get("h", 200))
+            x, y, w, h = d.get("x", 0), d.get("y", 0), d.get("w", 300), d.get("h", 200)
             self.points = [[x, y], [x + w, y], [x + w, y + h], [x, y + h]]
-        self.last_frame = None
-        self.background = None
+
+        self.last_lab = None
         self.confirm_count = 0
-        self.person_count = 0
-        self.person_present = False
-        self.last_person_check = 0
         self.last_event = 0.0
-        self.display_ratio = 0.0
-        self.raw_ratio = 0.0
-        self.last_reason = ""
         self._update_bounds()
 
     def _update_bounds(self):
         if len(self.points) >= 4:
-            xs = [int(p[0]) for p in self.points]
-            ys = [int(p[1]) for p in self.points]
-            self.x, self.y = min(xs), min(ys)
+            xs = [pt[0] for pt in self.points]
+            ys = [pt[1] for pt in self.points]
+            self.x = min(xs)
+            self.y = min(ys)
             self.w = max(10, max(xs) - self.x)
             self.h = max(10, max(ys) - self.y)
-            self.rel_points = np.array([[x - self.x, y - self.y] for x, y in self.points], np.int32)
+            self.rel_points = np.array([[pt[0] - self.x, pt[1] - self.y] for pt in self.points], dtype=np.int32)
         else:
             self.x, self.y, self.w, self.h = 0, 0, 100, 100
-            self.rel_points = np.array([[0, 0], [100, 0], [100, 100], [0, 100]], np.int32)
-
-    def reset_detector(self):
-        self.last_frame = None
-        self.background = None
-        self.confirm_count = 0
-        self.person_count = 0
-        self.person_present = False
-        self.display_ratio = 0.0
-        self.raw_ratio = 0.0
+            self.rel_points = np.array([[0,0], [100,0], [100,100], [0,100]], dtype=np.int32)
 
     def to_dict(self):
         return {
             "name": self.name,
             "enabled": self.enabled,
             "motion": self.motion,
-            "person": self.person,
             "sensitivity": self.sensitivity,
             "min_ratio": self.min_ratio,
-            "min_blob_ratio": self.min_blob_ratio,
+            "use_ai": self.use_ai,
+            "ai_target": self.ai_target,
+            "ai_conf": self.ai_conf,
             "confirm": self.confirm,
             "cooldown": self.cooldown,
             "auto_pause": self.auto_pause,
-            "person_conf": self.person_conf,
-            "person_confirm": self.person_confirm,
-            "person_interval": self.person_interval,
-            "points": self.points,
+            "points": self.points
         }
 
 
@@ -265,500 +280,507 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("监控变化报警")
-        icon = resource_path("app.ico")
-        if icon.exists():
-            self.setWindowIcon(QIcon(str(icon)))
-        self.resize(760, 760)
+        
+        icon_path = resource_path("app.ico")
+        if icon_path.exists():
+            try:
+                self.setWindowIcon(QIcon(str(icon_path)))
+            except Exception:
+                pass
+
+        # 允许自由调整大小，设置较小的最小尺寸，防止画面挤压
+        self.setMinimumSize(480, 520)
+        self.resize(540, 720)
+
         self.regions = []
-        self.events = []
         self.running = False
-        self.paused = False
         self.selected_index = -1
         self.sct = mss.mss()
         self.alarm = Alarm()
-        self.model = None
-        self.model_loading = False
-        self.model_error = ""
-        self.frame_counter = 0
-        self._build_ui()
-        # 区域显示层必须在首次调用 toggle_region_overlay() 之前创建，
-        # 否则启动时会出现 AttributeError: region_overlay。
         self.region_overlay = RegionOverlay(self)
+
+        # 加载本地 YOLO 模型 (yolo11n.pt)
+        self.yolo_model = None
+        self._init_yolo_model()
+
+        self._build_ui()
         self.auto_load_config()
+
         self.show_regions_cb.setChecked(True)
         self.toggle_region_overlay()
+
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.tick)
-        self.timer.start(220)
+        self.timer.start(250)
+
+    def _init_yolo_model(self):
+        """尝试从目录加载 yolo11n.pt 模型"""
+        if not YOLO_AVAILABLE:
+            return
+        
+        model_path = resource_path("yolo11n.pt")
+        if model_path.exists():
+            try:
+                self.yolo_model = YOLO(str(model_path))
+            except Exception as e:
+                print(f"YOLO模型加载失败: {e}")
 
     def _build_ui(self):
-        self.setStyleSheet("""
-        QWidget { font-family: 'Microsoft YaHei'; font-size: 10pt; }
-        QMainWindow, QWidget { background: #11161d; color: #e9eef5; }
-        QGroupBox { border: 1px solid #27313d; border-radius: 12px; margin-top: 12px; padding: 14px; background: #171e27; font-weight: bold; }
-        QGroupBox::title { subcontrol-origin: margin; left: 14px; padding: 0 7px; color: #8fdfff; }
-        QPushButton { background: #202a35; border: 1px solid #344252; border-radius: 9px; padding: 9px 13px; color: #eef5fb; }
-        QPushButton:hover { background: #293744; }
-        QPushButton:pressed { background: #16202a; }
-        QComboBox, QSpinBox, QDoubleSpinBox { background: #10161d; border: 1px solid #33404e; border-radius: 7px; padding: 6px; color: #eef5fb; }
-        QCheckBox { spacing: 8px; }
-        QListWidget { background: #10161d; border: 1px solid #27313d; border-radius: 9px; padding: 5px; }
-        QListWidget::item { padding: 8px; border-radius: 7px; }
-        QListWidget::item:selected { background: #173d4a; }
-        QProgressBar { border: 1px solid #33404e; border-radius: 6px; background: #0e1319; height: 13px; text-align: center; }
-        QProgressBar::chunk { background: #27d3ff; border-radius: 5px; }
-        """)
-        central = QWidget()
-        self.setCentralWidget(central)
-        root = QVBoxLayout(central)
-        root.setContentsMargins(18, 16, 18, 16)
-        root.setSpacing(12)
+        # 使用 ScrollArea 作为主容器，彻底避免按钮遮挡
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        self.setCentralWidget(scroll)
 
-        head = QHBoxLayout()
-        title_box = QVBoxLayout()
+        content = QWidget()
+        scroll.setWidget(content)
+        main_layout = QVBoxLayout(content)
+
+        # 1. 标题
         title = QLabel("监控变化报警")
-        title.setStyleSheet("font-size: 24px; font-weight: 800; color: #f4f8fc;")
-        subtitle = QLabel("屏幕区域智能监控 · 变化过滤 · 人员检测")
-        subtitle.setStyleSheet("color:#8b9aaa;")
-        title_box.addWidget(title)
-        title_box.addWidget(subtitle)
-        head.addLayout(title_box)
-        head.addStretch()
-        self.status_dot = QLabel("● 已停止")
-        self.status_dot.setStyleSheet("font-size:14px; font-weight:bold; color:#8794a3;")
-        head.addWidget(self.status_dot)
-        root.addLayout(head)
+        title.setStyleSheet("font-size:18px; font-weight:bold;")
+        main_layout.addWidget(title)
 
-        actions = QHBoxLayout()
-        self.select_btn = QPushButton("＋ 四点框选屏幕")
-        self.start_btn = QPushButton("▶ 开始监控")
-        self.pause_btn = QPushButton("Ⅱ 暂停")
-        self.test_btn = QPushButton("🔔 测试报警")
-        self.reset_btn = QPushButton("↻ 重置检测基准")
-        for b in [self.select_btn, self.start_btn, self.pause_btn, self.test_btn, self.reset_btn]:
-            actions.addWidget(b)
-        root.addLayout(actions)
+        # 2. 面板一：监控区域与选择器（可折叠）
+        box_region = CollapsibleBox("一、 监控区域设置")
+        
+        btn_layout_1 = QHBoxLayout()
+        self.select_btn = QPushButton("四点框选屏幕")
+        self.del_btn = QPushButton("删除当前区域")
+        self.test_btn = QPushButton("测试报警")
+        self.clear_btn = QPushButton("清理缓存")
+        btn_layout_1.addWidget(self.select_btn)
+        btn_layout_1.addWidget(self.del_btn)
+        btn_layout_1.addWidget(self.test_btn)
+        btn_layout_1.addWidget(self.clear_btn)
+        box_region.addLayout(btn_layout_1)
 
-        display_row = QHBoxLayout()
-        self.show_regions_cb = QCheckBox("显示框选区域")
-        self.show_regions_cb.setStyleSheet("color:#8fdfff; font-weight:bold;")
-        display_row.addWidget(self.show_regions_cb)
-        display_row.addStretch()
-        self.model_status = QLabel("人员模型：未加载")
-        self.model_status.setStyleSheet("color:#8b9aaa;")
-        display_row.addWidget(self.model_status)
-        root.addLayout(display_row)
-
-        body = QHBoxLayout()
-        body.setSpacing(12)
-        root.addLayout(body, 1)
-
-        left_box = QGroupBox("监控区域")
-        left_layout = QVBoxLayout(left_box)
+        form_region = QFormLayout()
         self.region_combo = QComboBox()
-        left_layout.addWidget(self.region_combo)
-        self.region_list = QListWidget()
-        left_layout.addWidget(self.region_list, 1)
-        del_btn = QPushButton("删除当前区域")
-        left_layout.addWidget(del_btn)
-        body.addWidget(left_box, 2)
+        self.region_combo.currentIndexChanged.connect(self.region_changed)
+        form_region.addRow("切换监控区域", self.region_combo)
 
-        right_col = QVBoxLayout()
-        body.addLayout(right_col, 3)
-
-        self.param_box = QGroupBox("检测参数")
-        form = QFormLayout(self.param_box)
-        form.setSpacing(9)
         self.pos_label = QLabel("-")
-        self.enable_cb = QCheckBox("启用该区域")
-        self.motion_cb = QCheckBox("检测画面变化")
-        self.person_cb = QCheckBox("检测人员（半身进入也尽量识别）")
-        self.auto_pause_cb = QCheckBox("报警后自动暂停")
-        self.sens = QSpinBox(); self.sens.setRange(0, 100); self.sens.setSuffix(" %")
-        self.ratio = QDoubleSpinBox(); self.ratio.setRange(0.05, 30); self.ratio.setSingleStep(0.05); self.ratio.setSuffix(" %")
-        self.blob = QDoubleSpinBox(); self.blob.setRange(0.01, 10); self.blob.setSingleStep(0.01); self.blob.setSuffix(" %")
-        self.confirm = QSpinBox(); self.confirm.setRange(1, 20); self.confirm.setSuffix(" 帧")
-        self.cooldown = QSpinBox(); self.cooldown.setRange(0, 3600); self.cooldown.setSuffix(" 秒")
-        self.person_conf = QDoubleSpinBox(); self.person_conf.setRange(0.10, 0.90); self.person_conf.setSingleStep(0.05)
-        self.person_confirm = QSpinBox(); self.person_confirm.setRange(1, 10); self.person_confirm.setSuffix(" 次")
-        self.person_interval = QSpinBox(); self.person_interval.setRange(1, 10); self.person_interval.setSuffix(" 帧")
-        form.addRow("范围", self.pos_label)
-        form.addRow("", self.enable_cb)
-        form.addRow("", self.motion_cb)
-        form.addRow("", self.person_cb)
-        form.addRow("画面灵敏度", self.sens)
-        form.addRow("变化触发面积", self.ratio)
-        form.addRow("有效大块变化", self.blob)
-        form.addRow("变化确认", self.confirm)
-        form.addRow("报警冷却", self.cooldown)
-        form.addRow("人员置信度", self.person_conf)
-        form.addRow("人员确认", self.person_confirm)
-        form.addRow("人员检测间隔", self.person_interval)
-        form.addRow("", self.auto_pause_cb)
-        right_col.addWidget(self.param_box)
+        form_region.addRow("多边形坐标范围", self.pos_label)
+        box_region.addLayout(form_region)
+        main_layout.addWidget(box_region)
 
-        live_box = QGroupBox("实时检测")
-        live = QFormLayout(live_box)
-        self.raw_label = QLabel("0.00 %")
-        self.smooth_label = QLabel("0.00 %")
-        self.threshold_label = QLabel("≥ 0.35 %")
-        self.person_label = QLabel("未检测")
-        self.reason_label = QLabel("-")
-        self.progress = QProgressBar(); self.progress.setRange(0, 100); self.progress.setValue(0)
-        live.addRow("原始变化", self.raw_label)
-        live.addRow("平滑变化", self.smooth_label)
-        live.addRow("触发阈值", self.threshold_label)
-        live.addRow("变化强度", self.progress)
-        live.addRow("人员状态", self.person_label)
-        live.addRow("最近事件", self.reason_label)
-        right_col.addWidget(live_box)
+        # 3. 面板二：检测参数与 YOLO AI 设置（可折叠）
+        box_params = CollapsibleBox("二、 检测参数与 YOLO AI")
+        form_params = QFormLayout()
 
-        event_box = QGroupBox("报警事件")
-        event_layout = QVBoxLayout(event_box)
-        self.event_list = QListWidget()
-        event_layout.addWidget(self.event_list)
-        export_btn = QPushButton("导出事件 CSV")
-        clear_btn = QPushButton("清理截图缓存")
-        row = QHBoxLayout(); row.addWidget(export_btn); row.addWidget(clear_btn)
-        event_layout.addLayout(row)
-        right_col.addWidget(event_box, 1)
+        self.enable_cb = QCheckBox("启用该区域监控")
+        self.motion_cb = QCheckBox("启用基础画面变化检测")
+        
+        self.sens = QSpinBox()
+        self.sens.setRange(0, 100)
+        self.sens.setSuffix(" %")
 
+        self.ratio = QDoubleSpinBox()
+        self.ratio.setRange(0.1, 50)
+        self.ratio.setSingleStep(0.1)
+        self.ratio.setSuffix(" %")
+
+        # YOLO AI 检测项
+        ai_status_str = " (yolo11n.pt已就绪)" if self.yolo_model else " (未就绪/缺乏yolo11n.pt)"
+        self.use_ai_cb = QCheckBox("启用 YOLO11 AI 目标识别" + ai_status_str)
+        self.use_ai_cb.setEnabled(self.yolo_model is not None)
+
+        self.ai_target_edit = QLineEdit()
+        self.ai_target_edit.setPlaceholderText("例如: person, car, dog 或 all")
+
+        self.ai_conf_spin = QDoubleSpinBox()
+        self.ai_conf_spin.setRange(0.1, 0.99)
+        self.ai_conf_spin.setSingleStep(0.05)
+
+        self.confirm = QSpinBox()
+        self.confirm.setRange(1, 30)
+
+        self.cooldown = QSpinBox()
+        self.cooldown.setRange(0, 3600)
+        self.cooldown.setSuffix(" 秒")
+
+        self.auto_pause_cb = QCheckBox("报警后自动暂停监控")
+
+        form_params.addRow("", self.enable_cb)
+        form_params.addRow("", self.motion_cb)
+        form_params.addRow("动静灵敏度", self.sens)
+        form_params.addRow("最小变化面积", self.ratio)
+        form_params.addRow("", self.use_ai_cb)
+        form_params.addRow("AI 识别目标", self.ai_target_edit)
+        form_params.addRow("AI 置信度阀值", self.ai_conf_spin)
+        form_params.addRow("连续确认帧", self.confirm)
+        form_params.addRow("报警冷却", self.cooldown)
+        form_params.addRow("", self.auto_pause_cb)
+
+        box_params.addLayout(form_params)
+        main_layout.addWidget(box_params)
+
+        # 绑定参数控制事件
+        for w in [self.enable_cb, self.motion_cb, self.use_ai_cb, self.auto_pause_cb]:
+            w.stateChanged.connect(self.apply_form)
+        for w in [self.sens, self.ratio, self.confirm, self.cooldown, self.ai_conf_spin]:
+            w.valueChanged.connect(self.apply_form)
+        self.ai_target_edit.textChanged.connect(self.apply_form)
+
+        # 4. 面板三：实时控制与状态（可折叠）
+        box_control = CollapsibleBox("三、 实时监测与控制")
+        btn_layout_2 = QHBoxLayout()
+        self.start_btn = QPushButton("开始监控")
+        self.pause_btn = QPushButton("暂停")
+        self.show_regions_cb = QCheckBox("显示桌面框选轮廓")
+        btn_layout_2.addWidget(self.start_btn)
+        btn_layout_2.addWidget(self.pause_btn)
+        btn_layout_2.addWidget(self.show_regions_cb)
+        box_control.addLayout(btn_layout_2)
+
+        self.status = QLabel("状态：未监控")
+        self.status.setStyleSheet("font-size:14px; font-weight:bold; color: #2c3e50; padding: 4px;")
+        box_control.addWidget(self.status)
+        main_layout.addWidget(box_control)
+
+        # 5. 面板四：报警日志记录（可折叠）
+        box_log = CollapsibleBox("四、 报警日志记录")
+        self.log_list = QListWidget()
+        self.log_list.setMaximumHeight(120)
+        box_log.addWidget(self.log_list)
+        main_layout.addWidget(box_log)
+
+        # 按钮槽函数连接
         self.select_btn.clicked.connect(self.select_region)
+        self.del_btn.clicked.connect(self.delete_region)
+        self.test_btn.clicked.connect(self.test_alarm)
+        self.clear_btn.clicked.connect(self.clear_cache)
         self.start_btn.clicked.connect(self.toggle_monitor)
         self.pause_btn.clicked.connect(self.toggle_pause)
-        self.test_btn.clicked.connect(self.test_alarm)
-        self.reset_btn.clicked.connect(self.reset_selected)
         self.show_regions_cb.stateChanged.connect(self.toggle_region_overlay)
-        del_btn.clicked.connect(self.delete_region)
-        export_btn.clicked.connect(self.export_csv)
-        clear_btn.clicked.connect(self.clear_cache)
-        self.region_combo.currentIndexChanged.connect(self.region_changed)
-        self.region_list.currentRowChanged.connect(self.region_list_changed)
-        for w in [self.enable_cb, self.motion_cb, self.person_cb, self.auto_pause_cb]:
-            w.stateChanged.connect(self.apply_form)
-        for w in [self.sens, self.ratio, self.blob, self.confirm, self.cooldown, self.person_conf, self.person_confirm, self.person_interval]:
-            w.valueChanged.connect(self.apply_form)
+
+        main_layout.addStretch()
 
     def virtual_geometry(self):
-        m = self.sct.monitors[0]
-        return QRect(m["left"], m["top"], m["width"], m["height"])
-
-    def screen_image(self):
         mon = self.sct.monitors[0]
-        shot = np.array(self.sct.grab(mon))
-        rgb = cv2.cvtColor(shot, cv2.COLOR_BGRA2RGB)
-        h, w, _ = rgb.shape
-        return QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888).copy(), mon
-
-    def select_region(self):
-        try:
-            image, mon = self.screen_image()
-            self.selector = Selector(image, mon["left"], mon["top"])
-            self.selector.selected.connect(self.add_region)
-            self.selector.show(); self.selector.raise_(); self.selector.activateWindow()
-        except Exception as e:
-            QMessageBox.critical(self, "框选失败", str(e))
-
-    def add_region(self, points):
-        r = Region({"points": points, "name": f"监控区域 {len(self.regions) + 1}"})
-        self.regions.append(r)
-        self.refresh_region_ui()
-        self.region_combo.setCurrentIndex(len(self.regions) - 1)
-        self.auto_save_config()
-        self.update_region_overlay()
-
-    def refresh_region_ui(self):
-        current = self.selected_index
-        self.region_combo.blockSignals(True); self.region_list.blockSignals(True)
-        self.region_combo.clear(); self.region_list.clear()
-        for i, r in enumerate(self.regions):
-            text = f"{i+1}. {r.name}  [{r.w}×{r.h}]"
-            if not r.enabled: text += " · 停用"
-            self.region_combo.addItem(text)
-            self.region_list.addItem(QListWidgetItem(text))
-        self.region_combo.blockSignals(False); self.region_list.blockSignals(False)
-        if self.regions:
-            idx = max(0, min(current if current >= 0 else 0, len(self.regions) - 1))
-            self.region_combo.setCurrentIndex(idx); self.region_list.setCurrentRow(idx)
-            self.region_changed(idx)
-
-    def region_list_changed(self, idx):
-        if idx >= 0 and idx != self.region_combo.currentIndex():
-            self.region_combo.setCurrentIndex(idx)
-
-    def region_changed(self, idx):
-        self.selected_index = idx
-        if not (0 <= idx < len(self.regions)):
-            self.pos_label.setText("-")
-            return
-        r = self.regions[idx]
-        self.pos_label.setText(f"X={r.x}  Y={r.y}  {r.w}×{r.h}")
-        widgets = [self.enable_cb, self.motion_cb, self.person_cb, self.auto_pause_cb, self.sens, self.ratio, self.blob, self.confirm, self.cooldown, self.person_conf, self.person_confirm, self.person_interval]
-        for w in widgets: w.blockSignals(True)
-        self.enable_cb.setChecked(r.enabled); self.motion_cb.setChecked(r.motion); self.person_cb.setChecked(r.person); self.auto_pause_cb.setChecked(r.auto_pause)
-        self.sens.setValue(r.sensitivity); self.ratio.setValue(r.min_ratio); self.blob.setValue(r.min_blob_ratio); self.confirm.setValue(r.confirm); self.cooldown.setValue(r.cooldown)
-        self.person_conf.setValue(r.person_conf); self.person_confirm.setValue(r.person_confirm); self.person_interval.setValue(r.person_interval)
-        for w in widgets: w.blockSignals(False)
-        self.update_live_labels(r)
-
-    def apply_form(self):
-        i = self.selected_index
-        if not (0 <= i < len(self.regions)): return
-        r = self.regions[i]
-        r.enabled = self.enable_cb.isChecked(); r.motion = self.motion_cb.isChecked(); r.person = self.person_cb.isChecked(); r.auto_pause = self.auto_pause_cb.isChecked()
-        r.sensitivity = self.sens.value(); r.min_ratio = self.ratio.value(); r.min_blob_ratio = self.blob.value(); r.confirm = self.confirm.value(); r.cooldown = self.cooldown.value()
-        r.person_conf = self.person_conf.value(); r.person_confirm = self.person_confirm.value(); r.person_interval = self.person_interval.value()
-        self.refresh_region_ui(); self.region_combo.setCurrentIndex(i); self.region_list.setCurrentRow(i); self.auto_save_config(); self.update_region_overlay()
-
-    def delete_region(self):
-        i = self.selected_index
-        if 0 <= i < len(self.regions):
-            del self.regions[i]
-            self.selected_index = -1
-            self.refresh_region_ui(); self.auto_save_config(); self.update_region_overlay()
-
-    def reset_selected(self):
-        if 0 <= self.selected_index < len(self.regions):
-            self.regions[self.selected_index].reset_detector()
-            self.update_live_labels(self.regions[self.selected_index])
-            self.status_dot.setText("● 检测基准已重置")
-            self.status_dot.setStyleSheet("font-size:14px; font-weight:bold; color:#27d3ff;")
+        return QRect(mon["left"], mon["top"], mon["width"], mon["height"])
 
     def toggle_region_overlay(self):
         if self.show_regions_cb.isChecked():
-            self.region_overlay.setGeometry(self.virtual_geometry()); self.region_overlay.show(); self.region_overlay.raise_()
+            self.region_overlay.setGeometry(self.virtual_geometry())
+            self.region_overlay.show()
+            self.region_overlay.raise_()
         else:
             self.region_overlay.hide()
         self.region_overlay.update()
 
     def update_region_overlay(self):
         if self.show_regions_cb.isChecked():
-            self.region_overlay.setGeometry(self.virtual_geometry()); self.region_overlay.update()
+            self.region_overlay.setGeometry(self.virtual_geometry())
+            self.region_overlay.update()
+
+    def screen_image(self):
+        mon = self.sct.monitors[0]
+        shot = np.array(self.sct.grab(mon))
+        rgb = cv2.cvtColor(shot, cv2.COLOR_BGRA2RGB)
+        h, w, _ = rgb.shape
+        return QImage(rgb.data, w, h, 3*w, QImage.Format_RGB888).copy(), mon
+
+    def select_region(self):
+        try:
+            image, mon = self.screen_image()
+            self.selector = Selector(image, mon["left"], mon["top"])
+            self.selector.selected.connect(self.add_region)
+            self.selector.show()
+            self.selector.raise_()
+            self.selector.activateWindow()
+        except Exception as e:
+            QMessageBox.critical(self, "错误", str(e))
+
+    def add_region(self, points):
+        r = Region({
+            "points": points,
+            "name": f"四点区域 {len(self.regions)+1}"
+        })
+        self.regions.append(r)
+        self.refresh_combo()
+        self.region_combo.setCurrentIndex(len(self.regions) - 1)
+        self.update_region_overlay()
+        self.auto_save_config()
+
+    def refresh_combo(self):
+        self.region_combo.blockSignals(True)
+        self.region_combo.clear()
+        for i, r in enumerate(self.regions):
+            text = f"{i+1}. {r.name} [{r.w}×{r.h}]"
+            if not r.enabled:
+                text += "（已停用）"
+            self.region_combo.addItem(text)
+        self.region_combo.blockSignals(False)
+
+    def region_changed(self, idx):
+        self.selected_index = idx
+        if 0 <= idx < len(self.regions):
+            r = self.regions[idx]
+            self.pos_label.setText(f"范围: {r.w}×{r.h} (X={r.x}, Y={r.y})")
+            
+            # 暂时阻塞信号
+            widgets = [self.enable_cb, self.motion_cb, self.sens, self.ratio,
+                       self.use_ai_cb, self.ai_target_edit, self.ai_conf_spin,
+                       self.confirm, self.cooldown, self.auto_pause_cb]
+            for w in widgets:
+                w.blockSignals(True)
+
+            self.enable_cb.setChecked(r.enabled)
+            self.motion_cb.setChecked(r.motion)
+            self.sens.setValue(r.sensitivity)
+            self.ratio.setValue(r.min_ratio)
+            self.use_ai_cb.setChecked(r.use_ai)
+            self.ai_target_edit.setText(r.ai_target)
+            self.ai_conf_spin.setValue(r.ai_conf)
+            self.confirm.setValue(r.confirm)
+            self.cooldown.setValue(r.cooldown)
+            self.auto_pause_cb.setChecked(r.auto_pause)
+
+            for w in widgets:
+                w.blockSignals(False)
+
+    def apply_form(self):
+        i = self.selected_index
+        if not (0 <= i < len(self.regions)):
+            return
+        r = self.regions[i]
+        r.enabled = self.enable_cb.isChecked()
+        r.motion = self.motion_cb.isChecked()
+        r.sensitivity = self.sens.value()
+        r.min_ratio = self.ratio.value()
+        r.use_ai = self.use_ai_cb.isChecked()
+        r.ai_target = self.ai_target_edit.text().strip() or "person"
+        r.ai_conf = self.ai_conf_spin.value()
+        r.confirm = self.confirm.value()
+        r.cooldown = self.cooldown.value()
+        r.auto_pause = self.auto_pause_cb.isChecked()
+        
+        self.refresh_combo()
+        self.region_combo.setCurrentIndex(i)
+        self.update_region_overlay()
+        self.auto_save_config()
+
+    def delete_region(self):
+        i = self.selected_index
+        if 0 <= i < len(self.regions):
+            del self.regions[i]
+            self.refresh_combo()
+            if self.regions:
+                new_idx = max(0, i - 1)
+                self.region_combo.setCurrentIndex(new_idx)
+                self.region_changed(new_idx)
+            else:
+                self.selected_index = -1
+                self.pos_label.setText("-")
+            self.update_region_overlay()
+            self.auto_save_config()
+
+    def clear_cache(self):
+        count = 0
+        try:
+            if SNAP_DIR.exists():
+                for f in SNAP_DIR.glob("*.jpg"):
+                    try:
+                        f.unlink()
+                        count += 1
+                    except Exception:
+                        pass
+            log_file = APP_DIR / "crash_log.txt"
+            if log_file.exists():
+                try:
+                    log_file.unlink()
+                    count += 1
+                except Exception:
+                    pass
+            QMessageBox.information(self, "清理完成", f"成功清理了 {count} 个缓存快照与临时文件。")
+        except Exception as e:
+            QMessageBox.critical(self, "清理失败", str(e))
 
     def toggle_monitor(self):
+        self.running = not self.running
         if self.running:
-            self.running = False; self.paused = False; self.start_btn.setText("▶ 开始监控"); self.pause_btn.setText("Ⅱ 暂停")
-            self.status_dot.setText("● 已停止"); self.status_dot.setStyleSheet("font-size:14px; font-weight:bold; color:#8794a3;")
+            self.start_btn.setText("停止监控")
+            self.status.setText("状态：正在监控屏幕")
+            for r in self.regions:
+                r.last_lab = None
+                r.confirm_count = 0
         else:
-            if not self.regions:
-                QMessageBox.warning(self, "没有监控区域", "请先框选至少一个监控区域。")
-                return
-            self.running = True; self.paused = False; self.start_btn.setText("■ 停止监控")
-            self.pause_btn.setText("Ⅱ 暂停")
-            for r in self.regions: r.reset_detector()
-            self.status_dot.setText("● 正在监控"); self.status_dot.setStyleSheet("font-size:14px; font-weight:bold; color:#35e68a;")
-            if any(r.person and r.enabled for r in self.regions): self.ensure_model()
+            self.start_btn.setText("开始监控")
+            self.status.setText("状态：已停止")
 
     def toggle_pause(self):
-        if not self.running: return
-        self.paused = not self.paused
-        self.pause_btn.setText("▶ 继续" if self.paused else "Ⅱ 暂停")
-        if self.paused:
-            self.status_dot.setText("● 已暂停"); self.status_dot.setStyleSheet("font-size:14px; font-weight:bold; color:#ffb020;")
-        else:
-            self.status_dot.setText("● 正在监控"); self.status_dot.setStyleSheet("font-size:14px; font-weight:bold; color:#35e68a;")
+        self.running = not self.running
+        self.pause_btn.setText("暂停" if self.running else "继续")
+        self.status.setText("状态：" + ("正在监控屏幕" if self.running else "已暂停"))
 
     def test_alarm(self):
         self.alarm.play()
-        if 0 <= self.selected_index < len(self.regions):
-            self.regions[self.selected_index].last_event = time.time(); self.update_region_overlay()
-
-    def ensure_model(self):
-        if YOLO is None or self.model is not None or self.model_loading: return
-        self.model_loading = True
-        self.model_status.setText("人员模型：正在加载/首次运行可能下载模型…")
-        def load():
-            try:
-                self.model = YOLO("yolo11n.pt")
-                self.model_status.setText("人员模型：已加载")
-            except Exception as e:
-                self.model_error = str(e)
-                self.model_status.setText("人员模型：加载失败（变化检测仍可用）")
-            finally:
-                self.model_loading = False
-        threading.Thread(target=load, daemon=True).start()
-
-    def roi_mask(self, r, shape):
-        mask = np.zeros(shape[:2], np.uint8)
-        pts = r.rel_points.copy()
-        pts[:, 0] = np.clip(pts[:, 0], 0, shape[1] - 1)
-        pts[:, 1] = np.clip(pts[:, 1], 0, shape[0] - 1)
-        cv2.fillPoly(mask, [pts], 255)
-        # 避免监控框本身造成变化
-        erode = max(2, min(8, int(min(r.w, r.h) * 0.006)))
-        if erode > 1:
-            k = np.ones((erode, erode), np.uint8)
-            e = cv2.erode(mask, k)
-            if np.count_nonzero(e) > 100: mask = e
-        return mask
-
-    def detect_motion(self, frame, r):
-        if not r.motion: return False
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        gray = cv2.GaussianBlur(gray, (5, 5), 0)
-        mask = self.roi_mask(r, gray.shape)
-        if r.last_frame is None:
-            r.last_frame = gray.copy(); r.background = gray.astype(np.float32); return False
-
-        # 一阶帧差：抓快速进入；背景差：过滤长期稳定画面
-        prev_diff = cv2.absdiff(r.last_frame, gray)
-        r.last_frame = gray.copy()
-        bg_u8 = cv2.convertScaleAbs(r.background)
-        bg_diff = cv2.absdiff(bg_u8, gray)
-        cv2.accumulateWeighted(gray, r.background, 0.018)
-
-        # 灵敏度越高，像素阈值越低
-        pix_threshold = max(12, int(42 - r.sensitivity * 0.28))
-        _, a = cv2.threshold(prev_diff, pix_threshold, 255, cv2.THRESH_BINARY)
-        _, b = cv2.threshold(bg_diff, pix_threshold + 4, 255, cv2.THRESH_BINARY)
-        th = cv2.bitwise_and(a, b)
-        th = cv2.bitwise_and(th, th, mask=mask)
-
-        # 去掉草叶、噪点等大量细小碎片，只统计有意义的大块变化
-        open_k = np.ones((3, 3), np.uint8)
-        th = cv2.morphologyEx(th, cv2.MORPH_OPEN, open_k, iterations=1)
-        th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8), iterations=1)
-        n, labels, stats, _ = cv2.connectedComponentsWithStats(th, 8)
-        min_blob_px = max(16, int(r.w * r.h * r.min_blob_ratio / 100.0))
-        valid = np.zeros_like(th)
-        for j in range(1, n):
-            area = int(stats[j, cv2.CC_STAT_AREA])
-            bw = int(stats[j, cv2.CC_STAT_WIDTH]); bh = int(stats[j, cv2.CC_STAT_HEIGHT])
-            if area >= min_blob_px and bw >= 8 and bh >= 8:
-                valid[labels == j] = 255
-        mask_pixels = max(1, np.count_nonzero(mask))
-        raw_ratio = np.count_nonzero(valid) / mask_pixels * 100.0
-        # 指数平滑，让 UI 不再疯狂跳动
-        r.raw_ratio = raw_ratio
-        r.display_ratio = r.display_ratio * 0.72 + raw_ratio * 0.28
-        return r.display_ratio >= r.min_ratio
-
-    def detect_person(self, frame, r):
-        if not r.person or self.model is None: return False
-        now_frame = self.frame_counter
-        if now_frame - r.last_person_check < r.person_interval: return r.person_present
-        r.last_person_check = now_frame
-        try:
-            result = self.model.predict(frame, conf=r.person_conf, classes=[0], imgsz=640, verbose=False)[0]
-            found = False
-            if result.boxes is not None and len(result.boxes):
-                boxes = result.boxes.xyxy.cpu().numpy()
-                # 只要人员框与四点区域有足够交集即可，半身进入也能触发
-                roi = r.rel_points.reshape((-1, 1, 2))
-                roi_mask = np.zeros(frame.shape[:2], np.uint8)
-                cv2.fillPoly(roi_mask, [r.rel_points], 255)
-                for x1, y1, x2, y2 in boxes:
-                    x1 = max(0, min(frame.shape[1] - 1, int(x1))); x2 = max(0, min(frame.shape[1], int(x2)))
-                    y1 = max(0, min(frame.shape[0] - 1, int(y1))); y2 = max(0, min(frame.shape[0], int(y2)))
-                    if x2 <= x1 or y2 <= y1: continue
-                    box = np.zeros(frame.shape[:2], np.uint8); box[y1:y2, x1:x2] = 255
-                    inter = cv2.countNonZero(cv2.bitwise_and(box, roi_mask))
-                    box_area = max(1, (x2 - x1) * (y2 - y1))
-                    if inter / box_area >= 0.08:
-                        found = True; break
-            if found: r.person_count += 1
-            else: r.person_count = max(0, r.person_count - 1)
-            r.person_present = r.person_count >= r.person_confirm
-            return r.person_present
-        except Exception:
-            return False
-
-    def trigger_alarm(self, r, frame, reasons):
-        now = time.time()
-        if now - r.last_event < r.cooldown: return False
-        r.last_event = now
-        r.last_reason = " + ".join(reasons)
-        stamp_full = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        filename = SNAP_DIR / (datetime.now().strftime("%Y%m%d_%H%M%S_%f") + ".jpg")
-        try: cv2.imwrite(str(filename), frame)
-        except Exception: filename = ""
-        self.events.append({"time": stamp_full, "region": r.name, "reason": r.last_reason, "snapshot": str(filename)})
-        self.event_list.insertItem(0, f"{datetime.now().strftime('%H:%M:%S')}  ·  {r.name}  ·  {r.last_reason}")
-        self.alarm.play()
-        self.status_dot.setText(f"● 报警：{r.name}")
-        self.status_dot.setStyleSheet("font-size:14px; font-weight:bold; color:#ff4d67;")
-        self.reason_label.setText(r.last_reason)
-        self.update_region_overlay()
-        if r.auto_pause:
-            self.running = False; self.paused = False; self.start_btn.setText("▶ 开始监控"); self.pause_btn.setText("Ⅱ 暂停")
-        return True
-
-    def tick(self):
-        if not self.running or self.paused: return
-        self.frame_counter += 1
-        for r in self.regions:
-            if not r.enabled: continue
-            frame = self.get_crop(r)
-            if frame is None or frame.size == 0: continue
-            motion = self.detect_motion(frame, r)
-            person = self.detect_person(frame, r)
-            if motion or person:
-                r.confirm_count += 1
-            else:
-                r.confirm_count = max(0, r.confirm_count - 1)
-            if r.confirm_count >= min(r.confirm, r.person_confirm if person else r.confirm):
-                reasons = []
-                if motion: reasons.append("画面变化")
-                if person: reasons.append("检测到人员")
-                self.trigger_alarm(r, frame, reasons)
-                r.confirm_count = 0
-            if r is self.regions[self.selected_index] if 0 <= self.selected_index < len(self.regions) else False:
-                self.update_live_labels(r)
-        self.update_region_overlay()
+        if self.regions and 0 <= self.selected_index < len(self.regions):
+            self.regions[self.selected_index].last_event = time.time()
+            self.update_region_overlay()
+        self.log_event("测试报警", "手动触发测试报警")
+        QMessageBox.information(self, "测试报警", "已触发测试报警声音并高亮变红。")
 
     def get_crop(self, r):
+        mon = self.sct.monitors[0]
+        x = r.x - mon["left"]
+        y = r.y - mon["top"]
+        if x < 0 or y < 0:
+            return None
         try:
-            img = np.array(self.sct.grab({"left": r.x, "top": r.y, "width": r.w, "height": r.h}))
+            img = np.array(self.sct.grab({
+                "left": r.x, "top": r.y, "width": r.w, "height": r.h
+            }))
             return cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
         except Exception:
             return None
 
-    def update_live_labels(self, r):
-        self.raw_label.setText(f"{r.raw_ratio:.2f} %")
-        self.smooth_label.setText(f"{r.display_ratio:.2f} %")
-        self.threshold_label.setText(f"≥ {r.min_ratio:.2f} %")
-        self.person_label.setText("发现人员" if r.person_present else "未检测到人员")
-        self.person_label.setStyleSheet("color:#ffb020; font-weight:bold;" if r.person_present else "color:#8b9aaa;")
-        self.reason_label.setText(r.last_reason or "-")
-        value = int(max(0, min(100, r.display_ratio / max(r.min_ratio, 0.05) * 100)))
-        self.progress.setValue(value)
+    def detect_event(self, frame, r):
+        """检测画面变化及 YOLO AI 目标"""
+        motion_triggered = False
 
-    def export_csv(self):
-        if not self.events:
-            QMessageBox.information(self, "没有事件", "当前没有报警事件。"); return
-        path = APP_DIR / "events.csv"
+        # 1. 基础画面变化检测
+        if r.motion:
+            lab = cv2.cvtColor(frame, cv2.COLOR_BGR2Lab)
+            lab = cv2.GaussianBlur(lab, (7, 7), 0)
+            
+            if r.last_lab is not None and r.last_lab.shape == lab.shape:
+                diff = cv2.absdiff(r.last_lab, lab)
+                diff_max = np.max(diff, axis=2)
+
+                mask = np.zeros((r.h, r.w), dtype=np.uint8)
+                cv2.fillPoly(mask, [r.rel_points], 255)
+
+                # 掩膜内缩 9px，隔离桌面轮廓框颜色变化
+                kernel_erode = np.ones((9, 9), np.uint8)
+                mask_eroded = cv2.erode(mask, kernel_erode)
+                if np.count_nonzero(mask_eroded) > 0:
+                    mask = mask_eroded
+
+                diff_masked = cv2.bitwise_and(diff_max, diff_max, mask=mask)
+
+                threshold = max(10, int(45 - r.sensitivity * 0.35))
+                _, th = cv2.threshold(diff_masked, threshold, 255, cv2.THRESH_BINARY)
+                
+                kernel_morph = np.ones((3, 3), np.uint8)
+                th = cv2.morphologyEx(th, cv2.MORPH_OPEN, kernel_morph)
+
+                mask_pixels = np.count_nonzero(mask)
+                if mask_pixels > 0:
+                    ratio = (np.count_nonzero(th) / float(mask_pixels)) * 100.0
+                    motion_triggered = (ratio >= r.min_ratio)
+
+            r.last_lab = lab
+
+        # 2. YOLO11 AI 目标识别
+        ai_triggered = False
+        if r.use_ai and self.yolo_model is not None:
+            try:
+                results = self.yolo_model.predict(frame, conf=r.ai_conf, verbose=False)
+                if len(results) > 0 and len(results[0].boxes) > 0:
+                    names = results[0].names
+                    target = r.ai_target.lower()
+                    for box in results[0].boxes:
+                        cls_id = int(box.cls[0])
+                        class_name = names.get(cls_id, "").lower()
+                        if target == "all" or target in class_name:
+                            ai_triggered = True
+                            break
+            except Exception:
+                pass
+
+        # 只要动静检测或 AI 检测其中一个满足条件即触发
+        return motion_triggered or ai_triggered
+
+    def log_event(self, region_name, msg):
+        stamp = datetime.now().strftime("%H:%M:%S")
+        self.log_list.addItem(QListWidgetItem(f"[{stamp}] {region_name}: {msg}"))
+        self.log_list.scrollToBottom()
+
+    def trigger_alarm(self, r, frame):
+        now = time.time()
+        if now - r.last_event < r.cooldown:
+            return False
+        r.last_event = now
+
         try:
-            with path.open("w", newline="", encoding="utf-8-sig") as f:
-                writer = csv.DictWriter(f, fieldnames=["time", "region", "reason", "snapshot"])
-                writer.writeheader(); writer.writerows(self.events)
-            QMessageBox.information(self, "导出成功", f"已导出：\n{path}")
-        except Exception as e:
-            QMessageBox.critical(self, "导出失败", str(e))
+            filename = SNAP_DIR / (datetime.now().strftime("%Y%m%d_%H%M%S_%f") + ".jpg")
+            cv2.imwrite(str(filename), frame)
+        except Exception:
+            pass
 
-    def clear_cache(self):
-        count = 0
-        for p in SNAP_DIR.glob("*.jpg"):
-            try: p.unlink(); count += 1
-            except Exception: pass
-        QMessageBox.information(self, "清理完成", f"已清理 {count} 张报警截图。")
+        self.alarm.play()
+        stamp = datetime.now().strftime("%H:%M:%S")
+        self.status.setText(f"状态：[{stamp}] {r.name} 触发报警！")
+        self.log_event(r.name, "触发画面变化/AI目标报警")
+        self.update_region_overlay()
+
+        if r.auto_pause:
+            self.running = False
+            self.start_btn.setText("开始监控")
+            self.status.setText(f"状态：[{stamp}] {r.name} 触发报警（已自动暂停）")
+        return True
+
+    def tick(self):
+        if not self.running:
+            return
+        
+        now = time.time()
+        need_overlay_refresh = False
+
+        for r in self.regions:
+            if not r.enabled:
+                continue
+
+            if now - r.last_event < 2.5:
+                need_overlay_refresh = True
+
+            frame = self.get_crop(r)
+            if frame is None or frame.size == 0:
+                continue
+
+            triggered = self.detect_event(frame, r)
+
+            if triggered:
+                r.confirm_count += 1
+            else:
+                r.confirm_count = 0
+
+            if r.confirm_count >= r.confirm:
+                self.trigger_alarm(r, frame)
+                r.confirm_count = 0
+
+        if need_overlay_refresh:
+            self.update_region_overlay()
 
     def auto_save_config(self):
         try:
-            CONFIG_FILE.write_text(json.dumps([r.to_dict() for r in self.regions], ensure_ascii=False, indent=2), encoding="utf-8")
-        except Exception: pass
+            CONFIG_FILE.write_text(
+                json.dumps([r.to_dict() for r in self.regions], ensure_ascii=False, indent=2),
+                encoding="utf-8"
+            )
+        except Exception:
+            pass
 
     def auto_load_config(self):
-        if not CONFIG_FILE.exists(): return
+        if not CONFIG_FILE.exists():
+            return
         try:
             data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
             self.regions = [Region(x) for x in data]
-            self.selected_index = 0 if self.regions else -1
-            self.refresh_region_ui()
-        except Exception: pass
+            self.refresh_combo()
+            if self.regions:
+                self.region_combo.setCurrentIndex(0)
+                self.region_changed(0)
+        except Exception:
+            pass
 
     def closeEvent(self, event):
-        try: self.region_overlay.close()
-        except Exception: pass
+        try:
+            self.region_overlay.close()
+        except Exception:
+            pass
         self.auto_save_config()
         event.accept()
 
@@ -766,7 +788,8 @@ class MainWindow(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
-    w = MainWindow(); w.show()
+    w = MainWindow()
+    w.show()
     sys.exit(app.exec())
 
 
