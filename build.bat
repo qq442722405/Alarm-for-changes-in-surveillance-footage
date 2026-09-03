@@ -1,7 +1,11 @@
 @echo off
 chcp 65001 >nul
+python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
-python -m PyInstaller --noconfirm --clean --windowed --onefile --name "监控回放智能监控" main.py
+pyinstaller --noconfirm --clean --windowed --onefile --name "屏幕监控智能报警" main.py
 echo.
-echo 打包完成：dist\监控回放智能监控.exe
+echo ========================================
+echo 打包完成：
+echo dist\屏幕监控智能报警.exe
+echo ========================================
 pause

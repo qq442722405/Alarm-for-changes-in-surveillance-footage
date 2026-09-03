@@ -1,4 +1,5 @@
 PySide6>=6.7,<7
+mss>=9.0,<11
 opencv-python>=4.10,<5
 numpy>=1.26,<3
 ultralytics>=8.3,<9

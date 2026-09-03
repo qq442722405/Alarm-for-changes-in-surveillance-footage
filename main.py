@@ -1,474 +1,539 @@
-import sys, os, json, csv, time, math
+import sys, json, time, csv, threading
 from pathlib import Path
-from dataclasses import dataclass, asdict
-import cv2
-import numpy as np
+from datetime import datetime
 
-from PySide6.QtCore import Qt, QTimer, Signal, QObject
-from PySide6.QtGui import QImage, QPixmap, QPainter, QPen, QColor, QFont
+import cv2
+import mss
+import numpy as np
+from PySide6.QtCore import Qt, QRect, QPoint, QTimer, Signal, QObject
+from PySide6.QtGui import QImage, QPixmap, QPainter, QPen
 from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QLabel, QPushButton, QListWidget,
-    QListWidgetItem, QFileDialog, QMessageBox, QVBoxLayout, QHBoxLayout,
-    QGridLayout, QSlider, QSpinBox, QDoubleSpinBox, QCheckBox, QGroupBox,
-    QProgressBar, QComboBox, QSplitter, QInputDialog
+    QApplication, QMainWindow, QWidget, QPushButton, QLabel, QListWidget,
+    QListWidgetItem, QVBoxLayout, QHBoxLayout, QFormLayout, QGroupBox,
+    QSpinBox, QDoubleSpinBox, QCheckBox, QMessageBox, QFileDialog,
+    QAbstractItemView
 )
 
-APP_NAME = "监控回放智能监控"
-CONFIG_DIR = Path.home() / ".monitor_replay_ai"
-CONFIG_DIR.mkdir(exist_ok=True)
-DEFAULT_CONFIG = CONFIG_DIR / "config.json"
+try:
+    from ultralytics import YOLO
+except Exception:
+    YOLO = None
 
-VIDEO_EXTS = "*.mp4 *.avi *.mov *.mkv *.wmv *.m4v"
+APP_DIR = Path.home() / ".screen_monitor_ai"
+APP_DIR.mkdir(parents=True, exist_ok=True)
+CONFIG_FILE = APP_DIR / "regions.json"
+EVENT_FILE = APP_DIR / "events.csv"
+SNAP_DIR = APP_DIR / "snapshots"
+SNAP_DIR.mkdir(exist_ok=True)
 
-@dataclass
-class Region:
-    name: str
-    x: int
-    y: int
-    w: int
-    h: int
-    sensitivity: int = 45
-    min_area: float = 0.8
-    confirm_frames: int = 3
-    cooldown: float = 5.0
-    motion: bool = True
-    person: bool = True
-    enabled: bool = True
 
-class VideoCanvas(QLabel):
-    region_added = Signal(tuple)
-    clicked_pos = Signal(int, int)
-    def __init__(self):
+class Alarm(QObject):
+    def play(self):
+        try:
+            import winsound
+            winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+        except Exception:
+            QApplication.beep()
+
+
+class Selector(QWidget):
+    selected = Signal(int, int, int, int)
+
+    def __init__(self, image, left, top):
         super().__init__()
-        self.setMinimumSize(720, 405)
-        self.setAlignment(Qt.AlignCenter)
-        self.setStyleSheet("background:#101010;border:1px solid #444;")
-        self.frame = None
-        self.scale = 1.0
-        self.offset_x = 0
-        self.offset_y = 0
-        self.drawing = False
-        self.start = None
-        self.current = None
-        self.select_mode = False
-        self.regions = []
-    def set_frame(self, frame):
-        self.frame = frame
-        self.update()
-    def set_regions(self, regions):
-        self.regions = regions
-        self.update()
-    def mousePressEvent(self, e):
-        if not self.frame:
-            return
-        if e.button() == Qt.LeftButton and self.select_mode:
-            self.drawing = True
-            self.start = (e.position().x(), e.position().y())
-            self.current = self.start
-        elif e.button() == Qt.LeftButton:
-            self.clicked_pos.emit(int(e.position().x()), int(e.position().y()))
-    def mouseMoveEvent(self, e):
-        if self.drawing:
-            self.current = (e.position().x(), e.position().y())
-            self.update()
-    def mouseReleaseEvent(self, e):
-        if self.drawing and e.button() == Qt.LeftButton:
-            self.drawing = False
-            x1,y1 = self.start; x2,y2 = self.current
-            x1,x2 = sorted([x1,x2]); y1,y2 = sorted([y1,y2])
-            if x2-x1 > 12 and y2-y1 > 12 and self.frame is not None:
-                fx = max(1, int((x1-self.offset_x)/self.scale))
-                fy = max(1, int((y1-self.offset_y)/self.scale))
-                fw = max(1, int((x2-x1)/self.scale))
-                fh = max(1, int((y2-y1)/self.scale))
-                h,w = self.frame.shape[:2]
-                fx=max(0,min(fx,w-1)); fy=max(0,min(fy,h-1))
-                fw=max(1,min(fw,w-fx)); fh=max(1,min(fh,h-fy))
-                self.region_added.emit((fx,fy,fw,fh))
-            self.select_mode=False
-            self.update()
-    def paintEvent(self, e):
-        super().paintEvent(e)
-        if self.frame is None:
-            return
-        h,w = self.frame.shape[:2]
-        pix = QImage(self.frame.data, w,h,self.frame.strides[0],QImage.Format_BGR888)
-        pm = QPixmap.fromImage(pix)
-        scaled = pm.scaled(self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        self.scale = scaled.width()/w
-        self.offset_x = (self.width()-scaled.width())/2
-        self.offset_y = (self.height()-scaled.height())/2
+        self.left, self.top = left, top
+        self.origin = QPoint()
+        self.current = QPoint()
+        self.dragging = False
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+        self.setAttribute(Qt.WA_TranslucentBackground, False)
+        self.setGeometry(left, top, image.width(), image.height())
+        self.pixmap = QPixmap.fromImage(image)
+
+    def paintEvent(self, event):
         p = QPainter(self)
-        p.drawPixmap(int(self.offset_x),int(self.offset_y),scaled)
-        p.setFont(QFont("Microsoft YaHei", 10))
-        for i,r in enumerate(self.regions):
-            rx=int(self.offset_x+r.x*self.scale); ry=int(self.offset_y+r.y*self.scale)
-            rw=int(r.w*self.scale); rh=int(r.h*self.scale)
-            pen=QPen(QColor(0,220,120),2)
-            p.setPen(pen)
-            p.drawRect(rx,ry,rw,rh)
-            p.drawText(rx+4,ry+16,f"{i+1} {r.name}")
-        if self.drawing and self.start and self.current:
-            x1,y1=self.start; x2,y2=self.current
-            p.setPen(QPen(QColor(255,200,0),2,Qt.DashLine))
-            p.drawRect(int(x1),int(y1),int(x2-x1),int(y2-y1))
-        p.end()
+        p.drawPixmap(0, 0, self.pixmap)
+        p.fillRect(self.rect(), Qt.black)
+        p.setOpacity(0.35)
+        p.fillRect(self.rect(), Qt.black)
+        p.setOpacity(1.0)
+        if self.dragging:
+            r = QRect(self.origin, self.current).normalized()
+            p.setPen(QPen(Qt.red, 3))
+            p.drawRect(r)
+            p.setPen(QPen(Qt.white, 1))
+            p.drawText(r.topLeft() + QPoint(5, 20),
+                       f"{r.width()} × {r.height()}")
+        else:
+            p.setPen(Qt.white)
+            p.drawText(30, 40, "拖动鼠标框选监控区域，松开鼠标完成；按 ESC 取消")
 
-class PersonDetector:
-    def __init__(self):
-        self.model = None
-        self.error = ""
-    def load(self):
-        if self.model is not None:
-            return True
-        try:
-            from ultralytics import YOLO
-            self.model = YOLO("yolo11n.pt")
-            return True
-        except Exception as e:
-            self.error = str(e)
-            return False
-    def detect(self, frame, conf=0.35):
-        if not self.load():
-            return []
-        try:
-            result = self.model.predict(frame, conf=conf, classes=[0], verbose=False, imgsz=640)[0]
-            out=[]
-            if result.boxes is not None:
-                for b in result.boxes:
-                    xyxy=b.xyxy[0].cpu().numpy().astype(int)
-                    score=float(b.conf[0])
-                    out.append((xyxy,score))
-            return out
-        except Exception as e:
-            self.error=str(e)
-            return []
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self.origin = e.position().toPoint()
+            self.current = self.origin
+            self.dragging = True
+            self.update()
 
-class MotionDetector:
-    def __init__(self):
-        self.prev = {}
-    def check(self, idx, crop, sensitivity, min_area):
-        if crop is None or crop.size == 0:
-            return False, 0.0
-        gray=cv2.cvtColor(crop,cv2.COLOR_BGR2GRAY)
-        gray=cv2.GaussianBlur(gray,(5,5),0)
-        old=self.prev.get(idx)
-        self.prev[idx]=gray
-        if old is None or old.shape != gray.shape:
-            return False,0.0
-        diff=cv2.absdiff(old,gray)
-        # sensitivity 0..100; higher means lower threshold
-        threshold=int(55 - sensitivity*0.45)
-        threshold=max(8,min(55,threshold))
-        mask=cv2.threshold(diff,threshold,255,cv2.THRESH_BINARY)[1]
-        kernel=np.ones((3,3),np.uint8)
-        mask=cv2.morphologyEx(mask,cv2.MORPH_OPEN,kernel)
-        mask=cv2.dilate(mask,kernel,iterations=1)
-        changed=float(np.count_nonzero(mask))/mask.size*100
-        return changed >= min_area, changed
+    def mouseMoveEvent(self, e):
+        if self.dragging:
+            self.current = e.position().toPoint()
+            self.update()
+
+    def mouseReleaseEvent(self, e):
+        if self.dragging and e.button() == Qt.LeftButton:
+            self.current = e.position().toPoint()
+            r = QRect(self.origin, self.current).normalized()
+            self.dragging = False
+            if r.width() >= 20 and r.height() >= 20:
+                self.selected.emit(
+                    self.left + r.x(), self.top + r.y(), r.width(), r.height()
+                )
+            self.close()
+
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key_Escape:
+            self.close()
+
+
+class Region:
+    def __init__(self, data=None):
+        d = data or {}
+        self.x = int(d.get("x", 0))
+        self.y = int(d.get("y", 0))
+        self.w = int(d.get("w", 300))
+        self.h = int(d.get("h", 200))
+        self.name = d.get("name", "监控区域")
+        self.enabled = bool(d.get("enabled", True))
+        self.motion = bool(d.get("motion", True))
+        self.person = bool(d.get("person", True))
+        self.sensitivity = int(d.get("sensitivity", 50))
+        self.min_ratio = float(d.get("min_ratio", 2.0))
+        self.confirm = int(d.get("confirm", 3))
+        self.cooldown = int(d.get("cooldown", 10))
+        self.auto_pause = bool(d.get("auto_pause", False))
+        self.last_gray = None
+        self.confirm_count = 0
+        self.last_event = 0.0
+
+    def to_dict(self):
+        return {
+            "x": self.x, "y": self.y, "w": self.w, "h": self.h,
+            "name": self.name, "enabled": self.enabled,
+            "motion": self.motion, "person": self.person,
+            "sensitivity": self.sensitivity, "min_ratio": self.min_ratio,
+            "confirm": self.confirm, "cooldown": self.cooldown,
+            "auto_pause": self.auto_pause
+        }
+
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(APP_NAME)
-        self.resize(1450,850)
-        self.video=None
-        self.video_path=""
-        self.frame_count=0
-        self.fps=25
-        self.frame_index=0
-        self.playing=False
-        self.auto_pause=True
-        self.regions=[]
-        self.events=[]
-        self.confirm={}
-        self.last_alarm={}
-        self.detector=MotionDetector()
-        self.person_detector=PersonDetector()
-        self.last_display=None
-        self.setup_ui()
-        self.timer=QTimer(self)
-        self.timer.timeout.connect(self.next_frame)
-        self.timer.setInterval(40)
-        self.load_config()
-    def setup_ui(self):
-        central=QWidget(); self.setCentralWidget(central)
-        root=QVBoxLayout(central)
-        top=QHBoxLayout()
-        self.open_btn=QPushButton("打开录像")
-        self.select_btn=QPushButton("框选区域")
-        self.start_btn=QPushButton("开始智能监控")
-        self.pause_btn=QPushButton("暂停")
-        self.step_back=QPushButton("◀ 单帧")
-        self.step_fwd=QPushButton("单帧 ▶")
-        self.jump_btn=QPushButton("跳到下一事件")
-        self.save_btn=QPushButton("保存配置")
-        self.load_btn=QPushButton("加载配置")
-        for b in [self.open_btn,self.select_btn,self.start_btn,self.pause_btn,self.step_back,self.step_fwd,self.jump_btn,self.save_btn,self.load_btn]:
-            top.addWidget(b)
-        root.addLayout(top)
-        split=QSplitter(Qt.Horizontal)
-        left=QWidget(); lv=QVBoxLayout(left)
-        self.canvas=VideoCanvas(); lv.addWidget(self.canvas,1)
-        self.progress=QSlider(Qt.Horizontal); self.progress.setRange(0,1000); lv.addWidget(self.progress)
-        self.time_label=QLabel("00:00:00 / 00:00:00"); lv.addWidget(self.time_label)
-        split.addWidget(left)
-        right=QWidget(); rv=QVBoxLayout(right)
-        rg=QGroupBox("监控区域")
-        rgl=QVBoxLayout(rg)
-        self.region_list=QListWidget(); rgl.addWidget(self.region_list,1)
-        btnrow=QHBoxLayout()
-        self.rename_btn=QPushButton("重命名"); self.del_btn=QPushButton("删除区域")
-        btnrow.addWidget(self.rename_btn); btnrow.addWidget(self.del_btn); rgl.addLayout(btnrow)
-        rv.addWidget(rg,2)
-        sg=QGroupBox("当前区域参数")
-        form=QGridLayout(sg)
-        self.enabled=QCheckBox("启用"); self.enabled.setChecked(True)
-        self.motion=QCheckBox("变化检测"); self.motion.setChecked(True)
-        self.person=QCheckBox("人员检测"); self.person.setChecked(True)
-        self.sensitivity=QSlider(Qt.Horizontal); self.sensitivity.setRange(0,100); self.sensitivity.setValue(45)
-        self.sens_label=QLabel("45")
-        self.min_area=QDoubleSpinBox(); self.min_area.setRange(0.05,30); self.min_area.setSingleStep(0.05); self.min_area.setValue(0.8)
-        self.confirm_spin=QSpinBox(); self.confirm_spin.setRange(1,30); self.confirm_spin.setValue(3)
-        self.cooldown=QDoubleSpinBox(); self.cooldown.setRange(0,300); self.cooldown.setValue(5); self.cooldown.setSuffix(" 秒")
-        self.auto_pause_cb=QCheckBox("发现事件自动暂停"); self.auto_pause_cb.setChecked(True)
-        form.addWidget(self.enabled,0,0); form.addWidget(self.motion,0,1); form.addWidget(self.person,0,2)
-        form.addWidget(QLabel("灵敏度"),1,0); form.addWidget(self.sensitivity,1,1); form.addWidget(self.sens_label,1,2)
-        form.addWidget(QLabel("最小变化比例 %"),2,0); form.addWidget(self.min_area,2,1)
-        form.addWidget(QLabel("连续确认帧"),3,0); form.addWidget(self.confirm_spin,3,1)
-        form.addWidget(QLabel("报警冷却"),4,0); form.addWidget(self.cooldown,4,1)
-        form.addWidget(self.auto_pause_cb,5,0,1,3)
-        rv.addWidget(sg)
-        ag=QGroupBox("事件记录")
-        al=QVBoxLayout(ag)
-        self.event_list=QListWidget(); al.addWidget(self.event_list)
-        self.export_btn=QPushButton("导出事件 CSV"); al.addWidget(self.export_btn)
-        rv.addWidget(ag,2)
-        split.addWidget(right); split.setSizes([1000,430])
-        root.addWidget(split,1)
-        self.status=QLabel("请打开监控录像，然后框选区域。")
-        root.addWidget(self.status)
-        self.open_btn.clicked.connect(self.open_video)
-        self.select_btn.clicked.connect(self.start_select)
+        self.setWindowTitle("屏幕监控智能报警")
+        self.resize(1120, 720)
+        self.regions = []
+        self.events = []
+        self.running = False
+        self.selected_index = -1
+        self.model = None
+        self.model_loading = False
+        self.sct = mss.mss()
+        self.alarm = Alarm()
+        self._build_ui()
+        self.load_config(silent=True)
+
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.tick)
+        self.timer.start(250)
+
+    def _build_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        main = QHBoxLayout(central)
+
+        left = QVBoxLayout()
+        title = QLabel("屏幕监控智能报警")
+        title.setStyleSheet("font-size:24px;font-weight:bold;")
+        left.addWidget(title)
+
+        tip = QLabel(
+            "说明：程序监控的是 Windows 实际屏幕，不打开视频文件。\n"
+            "先打开监控回放窗口，再点击“框选屏幕区域”。"
+        )
+        tip.setWordWrap(True)
+        left.addWidget(tip)
+
+        buttons = QHBoxLayout()
+        self.select_btn = QPushButton("框选屏幕区域")
+        self.start_btn = QPushButton("开始监控")
+        self.pause_btn = QPushButton("暂停")
+        self.test_btn = QPushButton("测试报警")
+        buttons.addWidget(self.select_btn)
+        buttons.addWidget(self.start_btn)
+        buttons.addWidget(self.pause_btn)
+        buttons.addWidget(self.test_btn)
+        left.addLayout(buttons)
+
+        self.select_btn.clicked.connect(self.select_region)
         self.start_btn.clicked.connect(self.toggle_monitor)
-        self.pause_btn.clicked.connect(self.toggle_play)
-        self.step_back.clicked.connect(lambda:self.seek(self.frame_index-1))
-        self.step_fwd.clicked.connect(lambda:self.seek(self.frame_index+1))
-        self.progress.sliderMoved.connect(lambda v:self.seek(int(v/1000*(self.frame_count-1)) if self.frame_count else 0))
-        self.region_list.currentRowChanged.connect(self.select_region)
-        self.rename_btn.clicked.connect(self.rename_region)
-        self.del_btn.clicked.connect(self.delete_region)
-        self.sensitivity.valueChanged.connect(self.apply_region)
-        self.sens_label.setText(str(self.sensitivity.value()))
-        self.min_area.valueChanged.connect(self.apply_region)
-        self.confirm_spin.valueChanged.connect(self.apply_region)
-        self.cooldown.valueChanged.connect(self.apply_region)
-        self.enabled.stateChanged.connect(self.apply_region)
-        self.motion.stateChanged.connect(self.apply_region)
-        self.person.stateChanged.connect(self.apply_region)
-        self.auto_pause_cb.stateChanged.connect(lambda:self._set_autopause())
-        self.event_list.itemDoubleClicked.connect(self.jump_event)
-        self.export_btn.clicked.connect(self.export_csv)
-        self.canvas.region_added.connect(self.add_region)
-    def _set_autopause(self):
-        self.auto_pause=self.auto_pause_cb.isChecked()
-    def open_video(self):
-        path,_=QFileDialog.getOpenFileName(self,"选择监控录像","",f"视频文件 ({VIDEO_EXTS.replace(' ',';')})")
-        if not path:return
-        if self.video: self.video.release()
-        self.video=cv2.VideoCapture(path)
-        if not self.video.isOpened():
-            QMessageBox.critical(self,"错误","无法打开视频。"); return
-        self.video_path=path
-        self.frame_count=int(self.video.get(cv2.CAP_PROP_FRAME_COUNT))
-        self.fps=self.video.get(cv2.CAP_PROP_FPS) or 25
-        self.frame_index=0; self.playing=False; self.events=[]; self.event_list.clear()
-        self.detector=MotionDetector(); self.read_frame()
-        self.status.setText(f"已打开：{Path(path).name}  | {self.frame_count} 帧 | {self.fps:.2f} FPS")
-    def read_frame(self):
-        if not self.video:return
-        self.video.set(cv2.CAP_PROP_POS_FRAMES,self.frame_index)
-        ok,frame=self.video.read()
-        if not ok:return
-        self.last_display=frame
-        self.canvas.set_frame(frame)
-        self.progress.blockSignals(True)
-        if self.frame_count>1:self.progress.setValue(int(self.frame_index/(self.frame_count-1)*1000))
-        self.progress.blockSignals(False)
-        sec=self.frame_index/self.fps
-        total=self.frame_count/self.fps
-        self.time_label.setText(f"{self.fmt(sec)} / {self.fmt(total)}")
-    def fmt(self,s):
-        s=int(max(0,s)); return f"{s//3600:02d}:{s%3600//60:02d}:{s%60:02d}"
-    def next_frame(self):
-        if not self.video:return
-        if self.frame_index>=self.frame_count-1:
-            self.playing=False; self.timer.stop(); return
-        self.frame_index+=1
-        self.video.set(cv2.CAP_PROP_POS_FRAMES,self.frame_index)
-        ok,frame=self.video.read()
-        if not ok:return
-        self.last_display=frame
-        self.detect_frame(frame)
-        self.canvas.set_frame(frame)
-        self.progress.blockSignals(True); self.progress.setValue(int(self.frame_index/(self.frame_count-1)*1000)); self.progress.blockSignals(False)
-        sec=self.frame_index/self.fps; total=self.frame_count/self.fps
-        self.time_label.setText(f"{self.fmt(sec)} / {self.fmt(total)}")
-    def seek(self,index):
-        if not self.video:return
-        self.frame_index=max(0,min(self.frame_count-1,index)); self.detector=MotionDetector(); self.read_frame()
-    def toggle_play(self):
-        self.playing=not self.playing
-        if self.playing:self.timer.start()
-        else:self.timer.stop()
-        self.pause_btn.setText("暂停" if self.playing else "播放")
-    def toggle_monitor(self):
-        if not self.video:
-            QMessageBox.information(self,"提示","请先打开录像。"); return
-        if not self.regions:
-            QMessageBox.information(self,"提示","请先框选至少一个区域。"); return
-        self.playing=not self.playing
-        if self.playing:
-            self.timer.start()
-            self.start_btn.setText("停止智能监控")
-            self.status.setText("智能监控运行中……")
-        else:
-            self.timer.stop()
-            self.start_btn.setText("开始智能监控")
-            self.status.setText("智能监控已停止。")
-    def start_select(self):
-        if self.last_display is None:
-            QMessageBox.information(self,"提示","请先打开录像。"); return
-        self.canvas.select_mode=True
-        self.status.setText("请在视频画面上拖动鼠标框选一个区域。")
-    def add_region(self,rect):
-        n=len(self.regions)+1
-        r=Region(f"区域 {n}",*rect)
-        self.regions.append(r)
-        self.refresh_regions()
-        self.region_list.setCurrentRow(len(self.regions)-1)
-        self.status.setText(f"已添加 {r.name}，可以继续框选其它区域。")
-    def refresh_regions(self):
-        self.region_list.clear()
-        for r in self.regions:
-            it=QListWidgetItem(f"{r.name}  {'●' if r.enabled else '○'}")
-            self.region_list.addItem(it)
-        self.canvas.set_regions(self.regions)
-    def select_region(self,row):
-        if row<0 or row>=len(self.regions):return
-        r=self.regions[row]
-        for w,val in [(self.sensitivity,r.sensitivity),(self.min_area,r.min_area),(self.confirm_spin,r.confirm_frames),(self.cooldown,r.cooldown)]:
-            w.blockSignals(True); w.setValue(val); w.blockSignals(False)
-        for w,val in [(self.enabled,r.enabled),(self.motion,r.motion),(self.person,r.person)]:
-            w.blockSignals(True); w.setChecked(val); w.blockSignals(False)
-        self.sens_label.setText(str(r.sensitivity))
-    def apply_region(self):
-        row=self.region_list.currentRow()
-        if row<0 or row>=len(self.regions):return
-        r=self.regions[row]
-        r.sensitivity=self.sensitivity.value(); self.sens_label.setText(str(r.sensitivity))
-        r.min_area=self.min_area.value(); r.confirm_frames=self.confirm_spin.value(); r.cooldown=self.cooldown.value()
-        r.enabled=self.enabled.isChecked(); r.motion=self.motion.isChecked(); r.person=self.person.isChecked()
-        self.refresh_regions(); self.region_list.setCurrentRow(row)
-    def rename_region(self):
-        row=self.region_list.currentRow()
-        if row<0:return
-        name,ok=QInputDialog.getText(self,"重命名","区域名称：",text=self.regions[row].name)
-        if ok and name.strip():
-            self.regions[row].name=name.strip(); self.refresh_regions(); self.region_list.setCurrentRow(row)
-    def delete_region(self):
-        row=self.region_list.currentRow()
-        if row<0:return
-        self.regions.pop(row); self.refresh_regions()
-    def detect_frame(self,frame):
-        for idx,r in enumerate(self.regions):
-            if not r.enabled: continue
-            crop=frame[r.y:r.y+r.h,r.x:r.x+r.w]
-            motion=False; change=0
-            if r.motion:
-                motion,change=self.detector.check(idx,crop,r.sensitivity,r.min_area)
-            person=False
-            boxes=[]
-            if r.person:
-                # Only run YOLO periodically to keep replay processing usable.
-                if self.frame_index % max(1,int(self.fps/4)) == 0:
-                    boxes=self.person_detector.detect(crop,conf=max(0.15,0.60-r.sensitivity*0.004))
-                    person=len(boxes)>0
-                    self._person_cache=(idx,self.frame_index,person,boxes)
-                elif getattr(self,"_person_cache",(None,))[0:1] == (idx,):
-                    person=self._person_cache[2]; boxes=self._person_cache[3]
-            trigger_type=None
-            if motion or person:
-                key=(idx, "person" if person else "motion")
-                self.confirm[key]=self.confirm.get(key,0)+1
-                if self.confirm[key] >= r.confirm_frames:
-                    now=time.time()
-                    if now-self.last_alarm.get(key,0)>=r.cooldown:
-                        trigger_type="人员" if person else "画面变化"
-                        self.last_alarm[key]=now
-                        self.confirm[key]=0
+        self.pause_btn.clicked.connect(self.toggle_pause)
+        self.test_btn.clicked.connect(self.test_alarm)
+
+        self.list = QListWidget()
+        self.list.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.list.currentRowChanged.connect(self.region_changed)
+        left.addWidget(QLabel("监控区域"))
+        left.addWidget(self.list)
+
+        manage = QHBoxLayout()
+        for text, fn in [
+            ("删除区域", self.delete_region),
+            ("保存配置", self.save_config),
+            ("加载配置", lambda: self.load_config(False)),
+            ("导出事件CSV", self.export_csv),
+        ]:
+            b = QPushButton(text)
+            b.clicked.connect(fn)
+            manage.addWidget(b)
+        left.addLayout(manage)
+
+        right = QVBoxLayout()
+        self.form_box = QGroupBox("当前区域设置")
+        form = QFormLayout(self.form_box)
+
+        self.name_edit = QLabel("-")
+        form.addRow("区域名称", self.name_edit)
+
+        self.pos_label = QLabel("-")
+        form.addRow("屏幕坐标", self.pos_label)
+
+        self.enable_cb = QCheckBox("启用")
+        self.motion_cb = QCheckBox("检测画面变化")
+        self.person_cb = QCheckBox("检测人员")
+        self.auto_pause_cb = QCheckBox("报警后自动暂停")
+
+        self.sens = QSpinBox()
+        self.sens.setRange(0, 100)
+        self.sens.setSuffix(" %")
+
+        self.ratio = QDoubleSpinBox()
+        self.ratio.setRange(0.1, 50)
+        self.ratio.setSingleStep(0.1)
+        self.ratio.setSuffix(" %")
+
+        self.confirm = QSpinBox()
+        self.confirm.setRange(1, 30)
+
+        self.cooldown = QSpinBox()
+        self.cooldown.setRange(0, 3600)
+        self.cooldown.setSuffix(" 秒")
+
+        form.addRow("", self.enable_cb)
+        form.addRow("", self.motion_cb)
+        form.addRow("", self.person_cb)
+        form.addRow("灵敏度", self.sens)
+        form.addRow("最小变化面积", self.ratio)
+        form.addRow("连续确认帧", self.confirm)
+        form.addRow("报警冷却", self.cooldown)
+        form.addRow("", self.auto_pause_cb)
+
+        for w in [self.enable_cb, self.motion_cb, self.person_cb,
+                  self.auto_pause_cb, self.sens, self.ratio,
+                  self.confirm, self.cooldown]:
+            if isinstance(w, QCheckBox):
+                w.stateChanged.connect(self.apply_form)
             else:
-                for key in [(idx,"motion"),(idx,"person")]:
-                    self.confirm[key]=0
-            if trigger_type:
-                self.add_event(r,trigger_type,change,frame,boxes)
-    def add_event(self,r,typ,change,frame,boxes):
-        sec=self.frame_index/self.fps
-        snap_dir=Path(__file__).resolve().parent/"snapshots"
-        snap_dir.mkdir(exist_ok=True)
-        stamp=time.strftime("%Y%m%d_%H%M%S")
-        snap=snap_dir/f"{stamp}_{self.frame_index}_{typ}.jpg"
-        out=frame.copy()
-        cv2.rectangle(out,(r.x,r.y),(r.x+r.w,r.y+r.h),(0,255,0),2)
-        if boxes:
-            for xyxy,_ in boxes:
-                x1,y1,x2,y2=map(int,xyxy); cv2.rectangle(out,(r.x+x1,r.y+y1),(r.x+x2,r.y+y2),(0,0,255),2)
-        cv2.imwrite(str(snap),out)
-        item={"frame":self.frame_index,"time":sec,"region":r.name,"type":typ,"change":round(float(change),3),"snapshot":str(snap)}
-        self.events.append(item)
-        li=QListWidgetItem(f"{self.fmt(sec)} | {r.name} | {typ} | 变化 {change:.2f}%")
-        li.setData(Qt.UserRole,item)
-        self.event_list.addItem(li)
-        self.status.setText(f"⚠ 发现{typ}：{r.name}，时间 {self.fmt(sec)}")
-        QApplication.beep()
-        if self.auto_pause:
-            self.playing=False; self.timer.stop(); self.start_btn.setText("开始智能监控")
-    def jump_event(self,item):
-        data=item.data(Qt.UserRole)
-        if data:self.seek(data["frame"])
-    def jump_btn_action(self):
-        pass
+                w.valueChanged.connect(self.apply_form)
+
+        right.addWidget(self.form_box)
+
+        right.addWidget(QLabel("事件记录"))
+        self.event_list = QListWidget()
+        right.addWidget(self.event_list)
+
+        self.status = QLabel("状态：未监控")
+        self.status.setStyleSheet("font-size:16px;")
+        right.addWidget(self.status)
+
+        main.addLayout(left, 3)
+        main.addLayout(right, 2)
+
+    def screen_image(self):
+        mon = self.sct.monitors[0]
+        shot = np.array(self.sct.grab(mon))
+        rgb = cv2.cvtColor(shot, cv2.COLOR_BGRA2RGB)
+        h, w, _ = rgb.shape
+        return QImage(rgb.data, w, h, 3*w, QImage.Format_RGB888).copy(), mon
+
+    def select_region(self):
+        try:
+            image, mon = self.screen_image()
+            self.selector = Selector(image, mon["left"], mon["top"])
+            self.selector.selected.connect(self.add_region)
+            self.selector.show()
+            self.selector.raise_()
+            self.selector.activateWindow()
+        except Exception as e:
+            QMessageBox.critical(self, "错误", str(e))
+
+    def add_region(self, x, y, w, h):
+        r = Region({"x": x, "y": y, "w": w, "h": h,
+                    "name": f"监控区域 {len(self.regions)+1}"})
+        self.regions.append(r)
+        self.refresh_list()
+        self.list.setCurrentRow(len(self.regions)-1)
+
+    def refresh_list(self):
+        self.list.clear()
+        for i, r in enumerate(self.regions):
+            text = f"{i+1}. {r.name}  [{r.w}×{r.h}]"
+            if not r.enabled:
+                text += "（停用）"
+            self.list.addItem(QListWidgetItem(text))
+
+    def region_changed(self, idx):
+        self.selected_index = idx
+        if 0 <= idx < len(self.regions):
+            r = self.regions[idx]
+            self.name_edit.setText(r.name)
+            self.pos_label.setText(f"X={r.x}  Y={r.y}  {r.w}×{r.h}")
+            self.enable_cb.setChecked(r.enabled)
+            self.motion_cb.setChecked(r.motion)
+            self.person_cb.setChecked(r.person)
+            self.sens.setValue(r.sensitivity)
+            self.ratio.setValue(r.min_ratio)
+            self.confirm.setValue(r.confirm)
+            self.cooldown.setValue(r.cooldown)
+            self.auto_pause_cb.setChecked(r.auto_pause)
+
+    def apply_form(self):
+        i = self.selected_index
+        if not (0 <= i < len(self.regions)):
+            return
+        r = self.regions[i]
+        r.enabled = self.enable_cb.isChecked()
+        r.motion = self.motion_cb.isChecked()
+        r.person = self.person_cb.isChecked()
+        r.sensitivity = self.sens.value()
+        r.min_ratio = self.ratio.value()
+        r.confirm = self.confirm.value()
+        r.cooldown = self.cooldown.value()
+        r.auto_pause = self.auto_pause_cb.isChecked()
+        self.refresh_list()
+        self.list.setCurrentRow(i)
+
+    def delete_region(self):
+        i = self.selected_index
+        if 0 <= i < len(self.regions):
+            del self.regions[i]
+            self.selected_index = -1
+            self.refresh_list()
+
+    def toggle_monitor(self):
+        self.running = not self.running
+        if self.running:
+            self.start_btn.setText("停止监控")
+            self.status.setText("状态：正在监控屏幕")
+            for r in self.regions:
+                r.last_gray = None
+                r.confirm_count = 0
+        else:
+            self.start_btn.setText("开始监控")
+            self.status.setText("状态：已停止")
+
+    def toggle_pause(self):
+        self.running = not self.running
+        self.pause_btn.setText("暂停" if self.running else "继续")
+        self.status.setText("状态：" + ("正在监控屏幕" if self.running else "已暂停"))
+
+    def test_alarm(self):
+        self.alarm.play()
+        QMessageBox.information(self, "测试报警", "已发送 Windows 报警提示音。")
+
+    def get_crop(self, r):
+        mon = self.sct.monitors[0]
+        x = r.x - mon["left"]
+        y = r.y - mon["top"]
+        if x < 0 or y < 0:
+            return None
+        try:
+            img = np.array(self.sct.grab({
+                "left": r.x, "top": r.y, "width": r.w, "height": r.h
+            }))
+            return cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+        except Exception:
+            return None
+
+    def ensure_model(self):
+        if YOLO is None or self.model is not None or self.model_loading:
+            return
+        self.model_loading = True
+        self.status.setText("状态：正在准备人员识别模型，首次运行可能需要联网下载……")
+
+        def load():
+            try:
+                model = YOLO("yolo11n.pt")
+                self.model = model
+            except Exception as e:
+                self.status.setText("状态：人员模型加载失败，画面变化检测仍可使用")
+            finally:
+                self.model_loading = False
+
+        threading.Thread(target=load, daemon=True).start()
+
+    def detect_person(self, frame, r):
+        if not r.person:
+            return False
+        self.ensure_model()
+        if self.model is None:
+            return False
+        try:
+            conf = max(0.15, 0.65 - r.sensitivity * 0.004)
+            result = self.model.predict(frame, conf=conf, classes=[0],
+                                        verbose=False, imgsz=640)[0]
+            return result.boxes is not None and len(result.boxes) > 0
+        except Exception:
+            return False
+
+    def detect_motion(self, frame, r):
+        if not r.motion:
+            return False
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (5, 5), 0)
+        if r.last_gray is None:
+            r.last_gray = gray
+            return False
+
+        diff = cv2.absdiff(r.last_gray, gray)
+        r.last_gray = gray
+        threshold = max(8, int(45 - r.sensitivity * 0.35))
+        _, th = cv2.threshold(diff, threshold, 255, cv2.THRESH_BINARY)
+        kernel = np.ones((3, 3), np.uint8)
+        th = cv2.morphologyEx(th, cv2.MORPH_OPEN, kernel)
+        th = cv2.dilate(th, kernel, iterations=2)
+        ratio = float(np.count_nonzero(th)) / float(th.size) * 100.0
+        return ratio >= r.min_ratio
+
+    def make_event(self, r, reason, frame):
+        now = time.time()
+        if now - r.last_event < r.cooldown:
+            return False
+        r.last_event = now
+
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        filename = SNAP_DIR / (datetime.now().strftime("%Y%m%d_%H%M%S_%f") + ".jpg")
+        try:
+            cv2.imwrite(str(filename), frame)
+        except Exception:
+            filename = None
+
+        self.events.append({
+            "time": stamp, "region": r.name, "reason": reason,
+            "snapshot": str(filename) if filename else ""
+        })
+        self.event_list.insertItem(
+            0, f"{stamp} | {r.name} | {reason}"
+        )
+        self.alarm.play()
+        if r.auto_pause:
+            self.running = False
+            self.start_btn.setText("开始监控")
+            self.status.setText("状态：报警后自动暂停")
+        return True
+
+    def tick(self):
+        if not self.running:
+            return
+        for r in self.regions:
+            if not r.enabled:
+                continue
+            frame = self.get_crop(r)
+            if frame is None or frame.size == 0:
+                continue
+
+            motion = self.detect_motion(frame, r)
+            person = self.detect_person(frame, r)
+
+            if motion or person:
+                r.confirm_count += 1
+            else:
+                r.confirm_count = 0
+
+            if r.confirm_count >= r.confirm:
+                reasons = []
+                if motion:
+                    reasons.append("画面发生变化")
+                if person:
+                    reasons.append("检测到人员")
+                self.make_event(r, " + ".join(reasons), frame)
+                r.confirm_count = 0
+
+    def save_config(self):
+        try:
+            CONFIG_FILE.write_text(
+                json.dumps([r.to_dict() for r in self.regions],
+                           ensure_ascii=False, indent=2),
+                encoding="utf-8"
+            )
+            QMessageBox.information(self, "保存成功", "监控区域配置已保存。")
+        except Exception as e:
+            QMessageBox.critical(self, "保存失败", str(e))
+
+    def load_config(self, silent=False):
+        if not CONFIG_FILE.exists():
+            return
+        try:
+            data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+            self.regions = [Region(x) for x in data]
+            self.refresh_list()
+            if self.regions:
+                self.list.setCurrentRow(0)
+            if not silent:
+                QMessageBox.information(self, "加载成功", "配置已加载。")
+        except Exception as e:
+            if not silent:
+                QMessageBox.critical(self, "加载失败", str(e))
+
     def export_csv(self):
         if not self.events:
-            QMessageBox.information(self,"提示","目前没有事件记录。"); return
-        path,_=QFileDialog.getSaveFileName(self,"导出事件 CSV","监控事件.csv","CSV (*.csv)")
-        if not path:return
-        with open(path,"w",newline="",encoding="utf-8-sig") as f:
-            w=csv.DictWriter(f,fieldnames=["frame","time","region","type","change","snapshot"])
-            w.writeheader(); w.writerows(self.events)
-        QMessageBox.information(self,"完成",f"已导出 {len(self.events)} 条事件。")
-    def save_config(self):
-        data=[asdict(r) for r in self.regions]
-        path,_=QFileDialog.getSaveFileName(self,"保存区域配置","监控区域配置.json","JSON (*.json)")
-        if not path:return
-        Path(path).write_text(json.dumps(data,ensure_ascii=False,indent=2),encoding="utf-8")
-    def load_config(self):
-        if not DEFAULT_CONFIG.exists():return
+            QMessageBox.information(self, "没有事件", "目前还没有报警事件。")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "导出事件CSV", "屏幕监控事件.csv", "CSV Files (*.csv)"
+        )
+        if not path:
+            return
         try:
-            data=json.loads(DEFAULT_CONFIG.read_text(encoding="utf-8"))
-            self.regions=[Region(**x) for x in data]; self.refresh_regions()
-        except: pass
-    def load_config_file(self):
-        pass
-    def closeEvent(self,e):
-        if self.video:self.video.release()
-        e.accept()
+            with open(path, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.DictWriter(
+                    f, fieldnames=["time", "region", "reason", "snapshot"]
+                )
+                writer.writeheader()
+                writer.writerows(self.events)
+            QMessageBox.information(self, "导出成功", path)
+        except Exception as e:
+            QMessageBox.critical(self, "导出失败", str(e))
+
+    def closeEvent(self, event):
+        try:
+            CONFIG_FILE.write_text(
+                json.dumps([r.to_dict() for r in self.regions],
+                           ensure_ascii=False, indent=2),
+                encoding="utf-8"
+            )
+        except Exception:
+            pass
+        event.accept()
+
 
 def main():
-    app=QApplication(sys.argv)
-    app.setApplicationName(APP_NAME)
-    w=MainWindow(); w.show()
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+    w = MainWindow()
+    w.show()
     sys.exit(app.exec())
 
-if __name__=="__main__":
+
+if __name__ == "__main__":
     main()

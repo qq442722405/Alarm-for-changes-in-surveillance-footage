@@ -1,8 +1,9 @@
 __pycache__/
 *.pyc
 .venv/
+venv/
 build/
 dist/
 *.spec
-snapshots/*.jpg
-models/*.pt
+.screen_monitor_ai/
+yolo11n.pt
