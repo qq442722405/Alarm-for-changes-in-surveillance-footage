@@ -134,7 +134,7 @@ class Selector(QWidget):
         p.setRenderHint(QPainter.Antialiasing)
 
         if len(self.points) > 0:
-            p.setPen(QPen(Qt.green, 3))
+            p.setPen(QPen(Qt.green, 2))
             p.setBrush(Qt.green)
             for pt in self.points:
                 p.drawEllipse(QPoint(pt[0] - self.left, pt[1] - self.top), 4, 4)
@@ -144,11 +144,11 @@ class Selector(QWidget):
                 poly.append(QPoint(pt[0] - self.left, pt[1] - self.top))
 
             if len(self.points) > 1:
-                p.setPen(QPen(Qt.green, 2, Qt.SolidLine))
+                p.setPen(QPen(Qt.green, 1, Qt.SolidLine))
                 for i in range(len(self.points) - 1):
                     p.drawLine(poly[i], poly[i+1])
 
-            p.setPen(QPen(Qt.yellow, 2, Qt.DashLine))
+            p.setPen(QPen(Qt.yellow, 1, Qt.DashLine))
             p.drawLine(poly[-1], self.current_pos)
 
         p.setPen(Qt.white)
@@ -194,7 +194,6 @@ class RegionOverlay(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         mon = self.owner.sct.monitors[0]
-        now = time.time()
 
         for i, r in enumerate(self.owner.regions):
             if not r.enabled or len(r.points) < 4:
@@ -204,15 +203,12 @@ class RegionOverlay(QWidget):
             for pt in r.points:
                 poly.append(QPoint(pt[0] - mon['left'], pt[1] - mon['top']))
 
-            is_alarm = (now - r.last_event) < 2.0
-            color = Qt.red if is_alarm else Qt.green
-
+            # 固定为绿色，且线宽保持为 1px 细线
             p.setBrush(Qt.NoBrush)
-            p.setPen(QPen(color, 3))
+            p.setPen(QPen(Qt.green, 1))
             p.drawPolygon(poly)
 
             top_pt = min([QPoint(pt[0] - mon['left'], pt[1] - mon['top']) for pt in r.points], key=lambda pt: pt.y())
-            p.setPen(QPen(color, 1))
             p.drawText(top_pt + QPoint(6, -6 if top_pt.y() > 20 else 20), f"{i+1}. {r.name}")
 
 
@@ -288,7 +284,7 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
-        # 允许自由调整大小，设置较小的最小尺寸，防止画面挤压
+        # 允许自由调整大小
         self.setMinimumSize(480, 520)
         self.resize(540, 720)
 
@@ -326,7 +322,6 @@ class MainWindow(QMainWindow):
                 print(f"YOLO模型加载失败: {e}")
 
     def _build_ui(self):
-        # 使用 ScrollArea 作为主容器，彻底避免按钮遮挡
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         self.setCentralWidget(scroll)
@@ -519,7 +514,6 @@ class MainWindow(QMainWindow):
             r = self.regions[idx]
             self.pos_label.setText(f"范围: {r.w}×{r.h} (X={r.x}, Y={r.y})")
             
-            # 暂时阻塞信号
             widgets = [self.enable_cb, self.motion_cb, self.sens, self.ratio,
                        self.use_ai_cb, self.ai_target_edit, self.ai_conf_spin,
                        self.confirm, self.cooldown, self.auto_pause_cb]
@@ -620,7 +614,7 @@ class MainWindow(QMainWindow):
             self.regions[self.selected_index].last_event = time.time()
             self.update_region_overlay()
         self.log_event("测试报警", "手动触发测试报警")
-        QMessageBox.information(self, "测试报警", "已触发测试报警声音并高亮变红。")
+        QMessageBox.information(self, "测试报警", "已触发测试报警声音。")
 
     def get_crop(self, r):
         mon = self.sct.monitors[0]
@@ -652,12 +646,7 @@ class MainWindow(QMainWindow):
                 mask = np.zeros((r.h, r.w), dtype=np.uint8)
                 cv2.fillPoly(mask, [r.rel_points], 255)
 
-                # 掩膜内缩 9px，隔离桌面轮廓框颜色变化
-                kernel_erode = np.ones((9, 9), np.uint8)
-                mask_eroded = cv2.erode(mask, kernel_erode)
-                if np.count_nonzero(mask_eroded) > 0:
-                    mask = mask_eroded
-
+                # 使用原始 mask 进行精确差分分析
                 diff_masked = cv2.bitwise_and(diff_max, diff_max, mask=mask)
 
                 threshold = max(10, int(45 - r.sensitivity * 0.35))
@@ -690,7 +679,6 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
-        # 只要动静检测或 AI 检测其中一个满足条件即触发
         return motion_triggered or ai_triggered
 
     def log_event(self, region_name, msg):
@@ -725,16 +713,10 @@ class MainWindow(QMainWindow):
     def tick(self):
         if not self.running:
             return
-        
-        now = time.time()
-        need_overlay_refresh = False
 
         for r in self.regions:
             if not r.enabled:
                 continue
-
-            if now - r.last_event < 2.5:
-                need_overlay_refresh = True
 
             frame = self.get_crop(r)
             if frame is None or frame.size == 0:
@@ -750,9 +732,6 @@ class MainWindow(QMainWindow):
             if r.confirm_count >= r.confirm:
                 self.trigger_alarm(r, frame)
                 r.confirm_count = 0
-
-        if need_overlay_refresh:
-            self.update_region_overlay()
 
     def auto_save_config(self):
         try:
