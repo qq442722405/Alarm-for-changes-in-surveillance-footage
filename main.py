@@ -6,7 +6,7 @@ import cv2
 import mss
 import numpy as np
 from PySide6.QtCore import Qt, QRect, QPoint, QTimer, Signal, QObject
-from PySide6.QtGui import QImage, QPixmap, QPainter, QPen
+from PySide6.QtGui import QImage, QPixmap, QPainter, QPen, QIcon
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QPushButton, QLabel, QListWidget,
     QListWidgetItem, QVBoxLayout, QHBoxLayout, QFormLayout, QGroupBox,
@@ -53,8 +53,8 @@ class Selector(QWidget):
     def paintEvent(self, event):
         p = QPainter(self)
         p.drawPixmap(0, 0, self.pixmap)
-        p.fillRect(self.rect(), Qt.black)
-        p.setOpacity(0.35)
+        # 保留底下屏幕内容可见，只做非常轻的遮罩，避免原来黑屏看不到监控画面。
+        p.setOpacity(0.08)
         p.fillRect(self.rect(), Qt.black)
         p.setOpacity(1.0)
         if self.dragging:
@@ -96,6 +96,32 @@ class Selector(QWidget):
             self.close()
 
 
+class RegionOverlay(QWidget):
+    """在实际屏幕上显示已框选区域，鼠标完全穿透。"""
+    def __init__(self, owner):
+        super().__init__()
+        self.owner = owner
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.setGeometry(owner.virtual_geometry())
+        self.hide()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        mon = self.owner.sct.monitors[0]
+        for i, r in enumerate(self.owner.regions):
+            if not r.enabled:
+                continue
+            rect = QRect(r.x - mon['left'], r.y - mon['top'], r.w, r.h)
+            p.setPen(QPen(Qt.red, 3))
+            p.drawRect(rect)
+            p.setPen(QPen(Qt.white, 1))
+            p.drawText(rect.topLeft() + QPoint(6, 20), f"{i+1}. {r.name}")
+
+
+
 class Region:
     def __init__(self, data=None):
         d = data or {}
@@ -131,6 +157,9 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("屏幕监控智能报警")
+        icon_path = Path(__file__).with_name("app.ico")
+        if icon_path.exists():
+            self.setWindowIcon(QIcon(str(icon_path)))
         self.resize(1120, 720)
         self.regions = []
         self.events = []
@@ -140,6 +169,7 @@ class MainWindow(QMainWindow):
         self.model_loading = False
         self.sct = mss.mss()
         self.alarm = Alarm()
+        self.region_overlay = RegionOverlay(self)
         self._build_ui()
         self.load_config(silent=True)
 
@@ -179,6 +209,11 @@ class MainWindow(QMainWindow):
         self.start_btn.clicked.connect(self.toggle_monitor)
         self.pause_btn.clicked.connect(self.toggle_pause)
         self.test_btn.clicked.connect(self.test_alarm)
+
+        self.show_regions_cb = QCheckBox("显示框选区域")
+        self.show_regions_cb.setChecked(False)
+        self.show_regions_cb.stateChanged.connect(self.toggle_region_overlay)
+        buttons.addWidget(self.show_regions_cb)
 
         self.list = QListWidget()
         self.list.setSelectionMode(QAbstractItemView.SingleSelection)
@@ -259,6 +294,24 @@ class MainWindow(QMainWindow):
         main.addLayout(left, 3)
         main.addLayout(right, 2)
 
+    def virtual_geometry(self):
+        mon = self.sct.monitors[0]
+        return QRect(mon["left"], mon["top"], mon["width"], mon["height"])
+
+    def toggle_region_overlay(self):
+        if self.show_regions_cb.isChecked():
+            self.region_overlay.setGeometry(self.virtual_geometry())
+            self.region_overlay.show()
+            self.region_overlay.raise_()
+        else:
+            self.region_overlay.hide()
+        self.region_overlay.update()
+
+    def update_region_overlay(self):
+        if self.show_regions_cb.isChecked():
+            self.region_overlay.setGeometry(self.virtual_geometry())
+            self.region_overlay.update()
+
     def screen_image(self):
         mon = self.sct.monitors[0]
         shot = np.array(self.sct.grab(mon))
@@ -283,6 +336,7 @@ class MainWindow(QMainWindow):
         self.regions.append(r)
         self.refresh_list()
         self.list.setCurrentRow(len(self.regions)-1)
+        self.update_region_overlay()
 
     def refresh_list(self):
         self.list.clear()
@@ -322,6 +376,7 @@ class MainWindow(QMainWindow):
         r.auto_pause = self.auto_pause_cb.isChecked()
         self.refresh_list()
         self.list.setCurrentRow(i)
+        self.update_region_overlay()
 
     def delete_region(self):
         i = self.selected_index
@@ -329,6 +384,7 @@ class MainWindow(QMainWindow):
             del self.regions[i]
             self.selected_index = -1
             self.refresh_list()
+            self.update_region_overlay()
 
     def toggle_monitor(self):
         self.running = not self.running
@@ -516,6 +572,10 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "导出失败", str(e))
 
     def closeEvent(self, event):
+        try:
+            self.region_overlay.close()
+        except Exception:
+            pass
         try:
             CONFIG_FILE.write_text(
                 json.dumps([r.to_dict() for r in self.regions],
