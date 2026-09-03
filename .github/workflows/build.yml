@@ -28,7 +28,7 @@ jobs:
       - name: Build EXE
         shell: pwsh
         run: |
-          pyinstaller --noconfirm --clean --windowed --onefile --name "屏幕监控智能报警" main.py
+          pyinstaller --noconfirm --clean --windowed --onefile --icon=app.ico --add-data "app.ico;." --name "屏幕监控智能报警" main.py
 
       - name: Prepare release
         shell: pwsh
