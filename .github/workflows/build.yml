@@ -1,9 +1,7 @@
 name: Build Executable
 
 on:
-  push:
-    branches: [ "main", "master" ]
-  workflow_dispatch:
+  workflow_dispatch:  # 仅保留手动触发按钮
 
 jobs:
   build:
