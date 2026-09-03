@@ -43,9 +43,9 @@ import numpy as np
 from PySide6.QtCore import Qt, QRect, QPoint, QTimer, Signal, QObject
 from PySide6.QtGui import QImage, QPixmap, QPainter, QPen, QIcon, QPolygon, QColor
 from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QPushButton, QLabel, QListWidget,
-    QListWidgetItem, QVBoxLayout, QHBoxLayout, QFormLayout, QGroupBox,
-    QSpinBox, QDoubleSpinBox, QCheckBox, QMessageBox, QAbstractItemView
+    QApplication, QMainWindow, QWidget, QPushButton, QLabel, QComboBox,
+    QVBoxLayout, QHBoxLayout, QFormLayout, QGroupBox,
+    QSpinBox, QDoubleSpinBox, QCheckBox, QMessageBox
 )
 
 APP_DIR = Path.home() / ".screen_monitor_ai"
@@ -89,8 +89,8 @@ class Selector(QWidget):
 
         # 绘制已点击的点位与连线
         if len(self.points) > 0:
-            p.setPen(QPen(Qt.red, 3))
-            p.setBrush(Qt.red)
+            p.setPen(QPen(Qt.green, 3))
+            p.setBrush(Qt.green)
             for pt in self.points:
                 p.drawEllipse(QPoint(pt[0] - self.left, pt[1] - self.top), 4, 4)
 
@@ -99,7 +99,7 @@ class Selector(QWidget):
                 poly.append(QPoint(pt[0] - self.left, pt[1] - self.top))
 
             if len(self.points) > 1:
-                p.setPen(QPen(Qt.red, 2, Qt.SolidLine))
+                p.setPen(QPen(Qt.green, 2, Qt.SolidLine))
                 for i in range(len(self.points) - 1):
                     p.drawLine(poly[i], poly[i+1])
 
@@ -107,7 +107,6 @@ class Selector(QWidget):
             p.setPen(QPen(Qt.yellow, 2, Qt.DashLine))
             p.drawLine(poly[-1], self.current_pos)
 
-        # 提示文字
         p.setPen(Qt.white)
         tip_str = f"请依次在屏幕上点击 4 个点位确定监控区域（已选择 {len(self.points)}/4 点）。按 Esc 取消，右键重置"
         p.drawText(30, 40, tip_str)
@@ -137,7 +136,7 @@ class Selector(QWidget):
 
 
 class RegionOverlay(QWidget):
-    """在桌面上实时渲染已框选的四点位半透明红框（鼠标穿透）"""
+    """在桌面上实时渲染已框选的四点位边框（无填充，默认绿色，报警时变红，鼠标穿透）"""
     def __init__(self, owner):
         super().__init__()
         self.owner = owner
@@ -151,6 +150,8 @@ class RegionOverlay(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         mon = self.owner.sct.monitors[0]
+        now = time.time()
+
         for i, r in enumerate(self.owner.regions):
             if not r.enabled or len(r.points) < 4:
                 continue
@@ -159,12 +160,17 @@ class RegionOverlay(QWidget):
             for pt in r.points:
                 poly.append(QPoint(pt[0] - mon['left'], pt[1] - mon['top']))
 
-            p.setBrush(QColor(255, 0, 0, 40))
-            p.setPen(QPen(Qt.red, 3))
+            # 只显示边框：默认绿色，报警后 2.5 秒内保持红色
+            is_alarm = (now - r.last_event) < 2.5
+            color = Qt.red if is_alarm else Qt.green
+
+            p.setBrush(Qt.NoBrush)          # 无颜色填充，仅保留外框
+            p.setPen(QPen(color, 3))        # 边框粗细 3px
             p.drawPolygon(poly)
 
+            # 绘制区域名字与序号
             top_pt = min([QPoint(pt[0] - mon['left'], pt[1] - mon['top']) for pt in r.points], key=lambda pt: pt.y())
-            p.setPen(QPen(Qt.white, 1))
+            p.setPen(QPen(color, 1))
             p.drawText(top_pt + QPoint(6, -6 if top_pt.y() > 20 else 20), f"{i+1}. {r.name}")
 
 
@@ -174,8 +180,11 @@ class Region:
         self.name = d.get("name", "监控区域")
         self.enabled = bool(d.get("enabled", True))
         self.motion = bool(d.get("motion", True))
-        self.sensitivity = int(d.get("sensitivity", 50))
-        self.min_ratio = float(d.get("min_ratio", 2.0))
+        
+        # 默认灵敏度 100%，默认最小变化面积 4.0%
+        self.sensitivity = int(d.get("sensitivity", 100))
+        self.min_ratio = float(d.get("min_ratio", 4.0))
+        
         self.confirm = int(d.get("confirm", 3))
         self.cooldown = int(d.get("cooldown", 10))
         self.auto_pause = bool(d.get("auto_pause", False))
@@ -229,7 +238,7 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
-        self.resize(960, 600)
+        self.resize(520, 620)
         self.regions = []
         self.running = False
         self.selected_index = -1
@@ -239,6 +248,10 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self.auto_load_config()
 
+        # 默认开启“显示框选区域”
+        self.show_regions_cb.setChecked(True)
+        self.toggle_region_overlay()
+
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.tick)
         self.timer.start(250)
@@ -246,28 +259,29 @@ class MainWindow(QMainWindow):
     def _build_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
-        main = QHBoxLayout(central)
+        main_layout = QVBoxLayout(central)
 
-        left = QVBoxLayout()
+        # 标题与说明
         title = QLabel("屏幕监控智能报警")
-        title.setStyleSheet("font-size:22px;font-weight:bold;")
-        left.addWidget(title)
+        title.setStyleSheet("font-size:20px; font-weight:bold;")
+        main_layout.addWidget(title)
 
         tip = QLabel("说明：点击“四点框选屏幕”在屏幕上顺次点击 4 个点建立监控区域。")
         tip.setWordWrap(True)
-        left.addWidget(tip)
+        main_layout.addWidget(tip)
 
-        # 第一排功能按钮
+        # 顶部操作按键区
         btn_layout_1 = QHBoxLayout()
         self.select_btn = QPushButton("四点框选屏幕")
         self.del_btn = QPushButton("删除区域")
         self.test_btn = QPushButton("测试报警")
+        self.clear_btn = QPushButton("清理缓存")
         btn_layout_1.addWidget(self.select_btn)
         btn_layout_1.addWidget(self.del_btn)
         btn_layout_1.addWidget(self.test_btn)
-        left.addLayout(btn_layout_1)
+        btn_layout_1.addWidget(self.clear_btn)
+        main_layout.addLayout(btn_layout_1)
 
-        # 第二排监控控制按钮
         btn_layout_2 = QHBoxLayout()
         self.start_btn = QPushButton("开始监控")
         self.pause_btn = QPushButton("暂停")
@@ -275,32 +289,28 @@ class MainWindow(QMainWindow):
         btn_layout_2.addWidget(self.start_btn)
         btn_layout_2.addWidget(self.pause_btn)
         btn_layout_2.addWidget(self.show_regions_cb)
-        left.addLayout(btn_layout_2)
+        main_layout.addLayout(btn_layout_2)
 
         self.select_btn.clicked.connect(self.select_region)
         self.del_btn.clicked.connect(self.delete_region)
         self.test_btn.clicked.connect(self.test_alarm)
+        self.clear_btn.clicked.connect(self.clear_cache)
         self.start_btn.clicked.connect(self.toggle_monitor)
         self.pause_btn.clicked.connect(self.toggle_pause)
         self.show_regions_cb.stateChanged.connect(self.toggle_region_overlay)
 
-        self.list = QListWidget()
-        self.list.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.list.currentRowChanged.connect(self.region_changed)
-        left.addWidget(QLabel("监控区域列表"))
-        left.addWidget(self.list)
-
-        right = QVBoxLayout()
+        # 当前区域参数设置面板
         self.form_box = QGroupBox("当前区域参数设置")
         form = QFormLayout(self.form_box)
 
-        self.name_edit = QLabel("-")
-        form.addRow("区域名称", self.name_edit)
+        self.region_combo = QComboBox()
+        self.region_combo.currentIndexChanged.connect(self.region_changed)
+        form.addRow("切换监控区域", self.region_combo)
 
         self.pos_label = QLabel("-")
         form.addRow("多边形范围", self.pos_label)
 
-        self.enable_cb = QCheckBox("启用")
+        self.enable_cb = QCheckBox("启用该区域")
         self.motion_cb = QCheckBox("检测画面变化")
         self.auto_pause_cb = QCheckBox("报警后自动暂停")
 
@@ -335,15 +345,13 @@ class MainWindow(QMainWindow):
             else:
                 w.valueChanged.connect(self.apply_form)
 
-        right.addWidget(self.form_box)
+        main_layout.addWidget(self.form_box)
 
+        # 底部状态栏
         self.status = QLabel("状态：未监控")
-        self.status.setStyleSheet("font-size:16px; font-weight:bold; color: #2c3e50;")
-        right.addWidget(self.status)
-        right.addStretch()
-
-        main.addLayout(left, 3)
-        main.addLayout(right, 2)
+        self.status.setStyleSheet("font-size:15px; font-weight:bold; color: #2c3e50;")
+        main_layout.addWidget(self.status)
+        main_layout.addStretch()
 
     def virtual_geometry(self):
         mon = self.sct.monitors[0]
@@ -387,25 +395,35 @@ class MainWindow(QMainWindow):
             "name": f"四点区域 {len(self.regions)+1}"
         })
         self.regions.append(r)
-        self.refresh_list()
-        self.list.setCurrentRow(len(self.regions)-1)
+        self.refresh_combo()
+        self.region_combo.setCurrentIndex(len(self.regions) - 1)
         self.update_region_overlay()
         self.auto_save_config()
 
-    def refresh_list(self):
-        self.list.clear()
+    def refresh_combo(self):
+        self.region_combo.blockSignals(True)
+        self.region_combo.clear()
         for i, r in enumerate(self.regions):
-            text = f"{i+1}. {r.name}  [范围: {r.w}×{r.h}]"
+            text = f"{i+1}. {r.name} [{r.w}×{r.h}]"
             if not r.enabled:
-                text += "（停用）"
-            self.list.addItem(QListWidgetItem(text))
+                text += "（已停用）"
+            self.region_combo.addItem(text)
+        self.region_combo.blockSignals(False)
 
     def region_changed(self, idx):
         self.selected_index = idx
         if 0 <= idx < len(self.regions):
             r = self.regions[idx]
-            self.name_edit.setText(r.name)
-            self.pos_label.setText(f"外接范围: {r.w}×{r.h} (X={r.x}, Y={r.y})")
+            self.pos_label.setText(f"范围: {r.w}×{r.h} (X={r.x}, Y={r.y})")
+            
+            self.enable_cb.blockSignals(True)
+            self.motion_cb.blockSignals(True)
+            self.sens.blockSignals(True)
+            self.ratio.blockSignals(True)
+            self.confirm.blockSignals(True)
+            self.cooldown.blockSignals(True)
+            self.auto_pause_cb.blockSignals(True)
+
             self.enable_cb.setChecked(r.enabled)
             self.motion_cb.setChecked(r.motion)
             self.sens.setValue(r.sensitivity)
@@ -413,6 +431,14 @@ class MainWindow(QMainWindow):
             self.confirm.setValue(r.confirm)
             self.cooldown.setValue(r.cooldown)
             self.auto_pause_cb.setChecked(r.auto_pause)
+
+            self.enable_cb.blockSignals(False)
+            self.motion_cb.blockSignals(False)
+            self.sens.blockSignals(False)
+            self.ratio.blockSignals(False)
+            self.confirm.blockSignals(False)
+            self.cooldown.blockSignals(False)
+            self.auto_pause_cb.blockSignals(False)
 
     def apply_form(self):
         i = self.selected_index
@@ -426,8 +452,9 @@ class MainWindow(QMainWindow):
         r.confirm = self.confirm.value()
         r.cooldown = self.cooldown.value()
         r.auto_pause = self.auto_pause_cb.isChecked()
-        self.refresh_list()
-        self.list.setCurrentRow(i)
+        
+        self.refresh_combo()
+        self.region_combo.setCurrentIndex(i)
         self.update_region_overlay()
         self.auto_save_config()
 
@@ -435,10 +462,38 @@ class MainWindow(QMainWindow):
         i = self.selected_index
         if 0 <= i < len(self.regions):
             del self.regions[i]
-            self.selected_index = -1
-            self.refresh_list()
+            self.refresh_combo()
+            if self.regions:
+                new_idx = max(0, i - 1)
+                self.region_combo.setCurrentIndex(new_idx)
+                self.region_changed(new_idx)
+            else:
+                self.selected_index = -1
+                self.pos_label.setText("-")
             self.update_region_overlay()
             self.auto_save_config()
+
+    def clear_cache(self):
+        """清理快照与崩溃日志文件"""
+        count = 0
+        try:
+            if SNAP_DIR.exists():
+                for f in SNAP_DIR.glob("*.jpg"):
+                    try:
+                        f.unlink()
+                        count += 1
+                    except Exception:
+                        pass
+            log_file = APP_DIR / "crash_log.txt"
+            if log_file.exists():
+                try:
+                    log_file.unlink()
+                    count += 1
+                except Exception:
+                    pass
+            QMessageBox.information(self, "清理完成", f"成功清理了 {count} 个缓存快照与临时文件。")
+        except Exception as e:
+            QMessageBox.critical(self, "清理失败", str(e))
 
     def toggle_monitor(self):
         self.running = not self.running
@@ -459,7 +514,10 @@ class MainWindow(QMainWindow):
 
     def test_alarm(self):
         self.alarm.play()
-        QMessageBox.information(self, "测试报警", "已成功触发 Windows 报警提示音。")
+        if self.regions and 0 <= self.selected_index < len(self.regions):
+            self.regions[self.selected_index].last_event = time.time()
+            self.update_region_overlay()
+        QMessageBox.information(self, "测试报警", "已触发测试报警声音并高亮变红。")
 
     def get_crop(self, r):
         mon = self.sct.monitors[0]
@@ -515,7 +573,6 @@ class MainWindow(QMainWindow):
             return False
         r.last_event = now
 
-        # 后台静默保存报警快照
         try:
             filename = SNAP_DIR / (datetime.now().strftime("%Y%m%d_%H%M%S_%f") + ".jpg")
             cv2.imwrite(str(filename), frame)
@@ -525,6 +582,7 @@ class MainWindow(QMainWindow):
         self.alarm.play()
         stamp = datetime.now().strftime("%H:%M:%S")
         self.status.setText(f"状态：[{stamp}] {r.name} 触发报警！")
+        self.update_region_overlay()  # 立即刷新边框变成红色
 
         if r.auto_pause:
             self.running = False
@@ -535,9 +593,18 @@ class MainWindow(QMainWindow):
     def tick(self):
         if not self.running:
             return
+        
+        now = time.time()
+        need_overlay_refresh = False
+
         for r in self.regions:
             if not r.enabled:
                 continue
+
+            # 如果处于报警红框维持时间内，持续刷新以确保红转绿过度及时
+            if now - r.last_event < 3.0:
+                need_overlay_refresh = True
+
             frame = self.get_crop(r)
             if frame is None or frame.size == 0:
                 continue
@@ -552,6 +619,9 @@ class MainWindow(QMainWindow):
             if r.confirm_count >= r.confirm:
                 self.trigger_alarm(r, frame)
                 r.confirm_count = 0
+
+        if need_overlay_refresh:
+            self.update_region_overlay()
 
     def auto_save_config(self):
         """配置自动保存"""
@@ -570,9 +640,10 @@ class MainWindow(QMainWindow):
         try:
             data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
             self.regions = [Region(x) for x in data]
-            self.refresh_list()
+            self.refresh_combo()
             if self.regions:
-                self.list.setCurrentRow(0)
+                self.region_combo.setCurrentIndex(0)
+                self.region_changed(0)
         except Exception:
             pass
 
