@@ -281,6 +281,9 @@ class MainWindow(QMainWindow):
         self.model_error = ""
         self.frame_counter = 0
         self._build_ui()
+        # 区域显示层必须在首次调用 toggle_region_overlay() 之前创建，
+        # 否则启动时会出现 AttributeError: region_overlay。
+        self.region_overlay = RegionOverlay(self)
         self.auto_load_config()
         self.show_regions_cb.setChecked(True)
         self.toggle_region_overlay()
