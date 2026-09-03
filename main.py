@@ -1,7 +1,45 @@
-import sys, json, time, csv, threading
+import sys, json, time, csv, threading, os, traceback, ctypes
 from pathlib import Path
 from datetime import datetime
 
+# ==================== 1. 静态资源与路径处理 (解决打包后找不到 app.ico 的问题) ====================
+def resource_path(relative_path):
+    """获取静态资源的绝对路径，兼容 PyInstaller 单文件打包模式 (_MEIPASS)"""
+    if hasattr(sys, '_MEIPASS'):
+        return Path(sys._MEIPASS) / relative_path
+    return Path(__file__).parent / relative_path
+
+# ==================== 2. 底层全局崩溃捕获 (解决双击无反应、静默闪退问题) ====================
+def handle_exception(exc_type, exc_value, exc_traceback):
+    """捕获全局未处理的异常，写入日志并弹出 Windows 原生提示框"""
+    err_msg = "".join(traceback.format_exception(exc_type, exc_value, exc_traceback))
+    
+    # 保存错误日志到用户目录
+    log_dir = Path.home() / ".screen_monitor_ai"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / "crash_log.txt"
+    try:
+        log_file.write_text(err_msg, encoding="utf-8")
+    except Exception:
+        pass
+        
+    # 使用 Windows 底层系统 API 强行弹窗（无需依赖 PySide6 是否初始化成功）
+    try:
+        ctypes.windll.user32.MessageBoxW(
+            0,
+            f"程序启动发生异常崩溃：\n\n{err_msg[:600]}\n\n完整日志已保存至：\n{log_file}",
+            "屏幕监控智能报警 - 运行错误",
+            0x10  # MB_ICONERROR
+        )
+    except Exception:
+        pass
+
+    sys.__excepthook__(exc_type, exc_value, exc_traceback)
+
+# 注册全局异常 Hook
+sys.excepthook = handle_exception
+
+# ==================== 3. 业务依赖导入 ====================
 import cv2
 import mss
 import numpy as np
@@ -121,7 +159,6 @@ class RegionOverlay(QWidget):
             p.drawText(rect.topLeft() + QPoint(6, 20), f"{i+1}. {r.name}")
 
 
-
 class Region:
     def __init__(self, data=None):
         d = data or {}
@@ -157,9 +194,15 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("屏幕监控智能报警")
-        icon_path = Path(__file__).with_name("app.ico")
+        
+        # 使用兼容性更好的资源加载获取 app.ico
+        icon_path = resource_path("app.ico")
         if icon_path.exists():
-            self.setWindowIcon(QIcon(str(icon_path)))
+            try:
+                self.setWindowIcon(QIcon(str(icon_path)))
+            except Exception:
+                pass
+
         self.resize(1120, 720)
         self.regions = []
         self.events = []
