@@ -36,7 +36,7 @@ def handle_exception(exc_type, exc_value, exc_traceback):
 
 sys.excepthook = handle_exception
 
-# ==================== 3. 核心业务与 YOLO 依赖 ====================
+# ==================== 3. 核心业务依赖 ====================
 import cv2
 import mss
 import numpy as np
@@ -45,16 +45,8 @@ from PySide6.QtGui import QImage, QPixmap, QPainter, QPen, QIcon, QPolygon, QCol
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QPushButton, QLabel, QComboBox,
     QVBoxLayout, QHBoxLayout, QFormLayout, QGroupBox, QSpinBox, QDoubleSpinBox,
-    QCheckBox, QMessageBox, QScrollArea, QToolButton, QListWidget, QListWidgetItem, QLineEdit
+    QCheckBox, QMessageBox, QScrollArea, QToolButton, QListWidget, QListWidgetItem
 )
-
-# 尝试导入 YOLO 框架
-YOLO_AVAILABLE = False
-try:
-    from ultralytics import YOLO
-    YOLO_AVAILABLE = True
-except ImportError:
-    YOLO_AVAILABLE = False
 
 APP_DIR = Path.home() / ".screen_monitor_ai"
 APP_DIR.mkdir(parents=True, exist_ok=True)
@@ -68,8 +60,9 @@ class CollapsibleBox(QWidget):
     def __init__(self, title="", parent=None):
         super().__init__(parent)
         self.toggle_button = QToolButton()
+        # 显式指定 color: #2c3e50，确保深浅色系统模式下字体都清晰
         self.toggle_button.setStyleSheet(
-            "QToolButton { border: none; font-weight: bold; font-size: 14px; text-align: left; padding: 6px; background-color: #e8ecef; border-radius: 4px; }"
+            "QToolButton { border: none; font-weight: bold; font-size: 14px; text-align: left; padding: 6px; color: #2c3e50; background-color: #e8ecef; border-radius: 4px; }"
             "QToolButton:hover { background-color: #dbe2e8; }"
         )
         self.toggle_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
@@ -180,7 +173,7 @@ class Selector(QWidget):
 
 
 class RegionOverlay(QWidget):
-    """桌面多边形边框渲染 Overlay"""
+    """桌面多边形边框渲染 Overlay（固定绿色细线）"""
     def __init__(self, owner):
         super().__init__()
         self.owner = owner
@@ -203,7 +196,7 @@ class RegionOverlay(QWidget):
             for pt in r.points:
                 poly.append(QPoint(pt[0] - mon['left'], pt[1] - mon['top']))
 
-            # 固定为绿色，且线宽保持为 1px 细线
+            # 固定绿色，线宽保持 1px 细线
             p.setBrush(Qt.NoBrush)
             p.setPen(QPen(Qt.green, 1))
             p.drawPolygon(poly)
@@ -217,16 +210,12 @@ class Region:
         d = data or {}
         self.name = d.get("name", "监控区域")
         self.enabled = bool(d.get("enabled", True))
-        self.motion = bool(d.get("motion", True))
         
-        # 画面变化检测参数
-        self.sensitivity = int(d.get("sensitivity", 100))
-        self.min_ratio = float(d.get("min_ratio", 4.0))
-        
-        # YOLO AI 检测参数
-        self.use_ai = bool(d.get("use_ai", False))
-        self.ai_target = str(d.get("ai_target", "person"))
-        self.ai_conf = float(d.get("ai_conf", 0.35))
+        # 高级画面检测参数
+        self.sensitivity = int(d.get("sensitivity", 70))       # 灵敏度 (1-100)
+        self.min_ratio = float(d.get("min_ratio", 2.0))         # 触发面积占比%
+        self.noise_filter = int(d.get("noise_filter", 3))       # 抗草木抖动/噪点等级 (1-10)
+        self.learn_speed = float(d.get("learn_speed", 0.01))    # 日夜/光线适应速度 (0.001 - 0.1)
 
         self.confirm = int(d.get("confirm", 3))
         self.cooldown = int(d.get("cooldown", 10))
@@ -237,10 +226,10 @@ class Region:
             x, y, w, h = d.get("x", 0), d.get("y", 0), d.get("w", 300), d.get("h", 200)
             self.points = [[x, y], [x + w, y], [x + w, y + h], [x, y + h]]
 
-        self.last_lab = None
         self.confirm_count = 0
         self.last_event = 0.0
         self._update_bounds()
+        self.init_subtractor()
 
     def _update_bounds(self):
         if len(self.points) >= 4:
@@ -255,16 +244,23 @@ class Region:
             self.x, self.y, self.w, self.h = 0, 0, 100, 100
             self.rel_points = np.array([[0,0], [100,0], [100,100], [0,100]], dtype=np.int32)
 
+    def init_subtractor(self):
+        """初始化混合高斯背景提取器，适应复杂的户外/白天黑夜环境"""
+        var_threshold = max(8, int(100 - self.sensitivity * 0.8))
+        self.subtractor = cv2.createBackgroundSubtractorMOG2(
+            history=500,
+            varThreshold=var_threshold,
+            detectShadows=True
+        )
+
     def to_dict(self):
         return {
             "name": self.name,
             "enabled": self.enabled,
-            "motion": self.motion,
             "sensitivity": self.sensitivity,
             "min_ratio": self.min_ratio,
-            "use_ai": self.use_ai,
-            "ai_target": self.ai_target,
-            "ai_conf": self.ai_conf,
+            "noise_filter": self.noise_filter,
+            "learn_speed": self.learn_speed,
             "confirm": self.confirm,
             "cooldown": self.cooldown,
             "auto_pause": self.auto_pause,
@@ -286,7 +282,7 @@ class MainWindow(QMainWindow):
 
         # 允许自由调整大小
         self.setMinimumSize(480, 520)
-        self.resize(540, 720)
+        self.resize(540, 680)
 
         self.regions = []
         self.running = False
@@ -294,10 +290,6 @@ class MainWindow(QMainWindow):
         self.sct = mss.mss()
         self.alarm = Alarm()
         self.region_overlay = RegionOverlay(self)
-
-        # 加载本地 YOLO 模型 (yolo11n.pt)
-        self.yolo_model = None
-        self._init_yolo_model()
 
         self._build_ui()
         self.auto_load_config()
@@ -309,18 +301,6 @@ class MainWindow(QMainWindow):
         self.timer.timeout.connect(self.tick)
         self.timer.start(250)
 
-    def _init_yolo_model(self):
-        """尝试从目录加载 yolo11n.pt 模型"""
-        if not YOLO_AVAILABLE:
-            return
-        
-        model_path = resource_path("yolo11n.pt")
-        if model_path.exists():
-            try:
-                self.yolo_model = YOLO(str(model_path))
-            except Exception as e:
-                print(f"YOLO模型加载失败: {e}")
-
     def _build_ui(self):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -330,9 +310,9 @@ class MainWindow(QMainWindow):
         scroll.setWidget(content)
         main_layout = QVBoxLayout(content)
 
-        # 1. 标题
+        # 1. 主标题（显式设置深灰色文字 color: #1a1a1a，防止白底白字）
         title = QLabel("监控变化报警")
-        title.setStyleSheet("font-size:18px; font-weight:bold;")
+        title.setStyleSheet("font-size:18px; font-weight:bold; color: #1a1a1a; padding: 2px;")
         main_layout.addWidget(title)
 
         # 2. 面板一：监控区域与选择器（可折叠）
@@ -359,33 +339,30 @@ class MainWindow(QMainWindow):
         box_region.addLayout(form_region)
         main_layout.addWidget(box_region)
 
-        # 3. 面板二：检测参数与 YOLO AI 设置（可折叠）
-        box_params = CollapsibleBox("二、 检测参数与 YOLO AI")
+        # 3. 面板二：算法优化参数（可折叠）
+        box_params = CollapsibleBox("二、 画面检测抗干扰参数")
         form_params = QFormLayout()
 
         self.enable_cb = QCheckBox("启用该区域监控")
-        self.motion_cb = QCheckBox("启用基础画面变化检测")
         
         self.sens = QSpinBox()
-        self.sens.setRange(0, 100)
+        self.sens.setRange(1, 100)
         self.sens.setSuffix(" %")
 
         self.ratio = QDoubleSpinBox()
-        self.ratio.setRange(0.1, 50)
+        self.ratio.setRange(0.1, 50.0)
         self.ratio.setSingleStep(0.1)
         self.ratio.setSuffix(" %")
 
-        # YOLO AI 检测项
-        ai_status_str = " (yolo11n.pt已就绪)" if self.yolo_model else " (未就绪/缺乏yolo11n.pt)"
-        self.use_ai_cb = QCheckBox("启用 YOLO11 AI 目标识别" + ai_status_str)
-        self.use_ai_cb.setEnabled(self.yolo_model is not None)
+        self.noise = QSpinBox()
+        self.noise.setRange(1, 10)
+        self.noise.setToolTip("数字越大，越能过滤风吹草动、雨雪微小颗粒的晃动干扰")
 
-        self.ai_target_edit = QLineEdit()
-        self.ai_target_edit.setPlaceholderText("例如: person, car, dog 或 all")
-
-        self.ai_conf_spin = QDoubleSpinBox()
-        self.ai_conf_spin.setRange(0.1, 0.99)
-        self.ai_conf_spin.setSingleStep(0.05)
+        self.learn_rate = QDoubleSpinBox()
+        self.learn_rate.setRange(0.001, 0.1)
+        self.learn_rate.setSingleStep(0.005)
+        self.learn_rate.setDecimals(3)
+        self.learn_rate.setToolTip("调整光线渐变适应速度（如云影过境、白天黑夜切换）")
 
         self.confirm = QSpinBox()
         self.confirm.setRange(1, 30)
@@ -397,12 +374,10 @@ class MainWindow(QMainWindow):
         self.auto_pause_cb = QCheckBox("报警后自动暂停监控")
 
         form_params.addRow("", self.enable_cb)
-        form_params.addRow("", self.motion_cb)
         form_params.addRow("动静灵敏度", self.sens)
-        form_params.addRow("最小变化面积", self.ratio)
-        form_params.addRow("", self.use_ai_cb)
-        form_params.addRow("AI 识别目标", self.ai_target_edit)
-        form_params.addRow("AI 置信度阀值", self.ai_conf_spin)
+        form_params.addRow("触发变化面积", self.ratio)
+        form_params.addRow("抗草木抖动等级", self.noise)
+        form_params.addRow("光线适应速度", self.learn_rate)
         form_params.addRow("连续确认帧", self.confirm)
         form_params.addRow("报警冷却", self.cooldown)
         form_params.addRow("", self.auto_pause_cb)
@@ -411,11 +386,10 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(box_params)
 
         # 绑定参数控制事件
-        for w in [self.enable_cb, self.motion_cb, self.use_ai_cb, self.auto_pause_cb]:
+        for w in [self.enable_cb, self.auto_pause_cb]:
             w.stateChanged.connect(self.apply_form)
-        for w in [self.sens, self.ratio, self.confirm, self.cooldown, self.ai_conf_spin]:
+        for w in [self.sens, self.ratio, self.noise, self.learn_rate, self.confirm, self.cooldown]:
             w.valueChanged.connect(self.apply_form)
-        self.ai_target_edit.textChanged.connect(self.apply_form)
 
         # 4. 面板三：实时控制与状态（可折叠）
         box_control = CollapsibleBox("三、 实时监测与控制")
@@ -514,19 +488,16 @@ class MainWindow(QMainWindow):
             r = self.regions[idx]
             self.pos_label.setText(f"范围: {r.w}×{r.h} (X={r.x}, Y={r.y})")
             
-            widgets = [self.enable_cb, self.motion_cb, self.sens, self.ratio,
-                       self.use_ai_cb, self.ai_target_edit, self.ai_conf_spin,
-                       self.confirm, self.cooldown, self.auto_pause_cb]
+            widgets = [self.enable_cb, self.sens, self.ratio, self.noise,
+                       self.learn_rate, self.confirm, self.cooldown, self.auto_pause_cb]
             for w in widgets:
                 w.blockSignals(True)
 
             self.enable_cb.setChecked(r.enabled)
-            self.motion_cb.setChecked(r.motion)
             self.sens.setValue(r.sensitivity)
             self.ratio.setValue(r.min_ratio)
-            self.use_ai_cb.setChecked(r.use_ai)
-            self.ai_target_edit.setText(r.ai_target)
-            self.ai_conf_spin.setValue(r.ai_conf)
+            self.noise.setValue(r.noise_filter)
+            self.learn_rate.setValue(r.learn_speed)
             self.confirm.setValue(r.confirm)
             self.cooldown.setValue(r.cooldown)
             self.auto_pause_cb.setChecked(r.auto_pause)
@@ -540,16 +511,20 @@ class MainWindow(QMainWindow):
             return
         r = self.regions[i]
         r.enabled = self.enable_cb.isChecked()
-        r.motion = self.motion_cb.isChecked()
+        
+        old_sens = r.sensitivity
         r.sensitivity = self.sens.value()
         r.min_ratio = self.ratio.value()
-        r.use_ai = self.use_ai_cb.isChecked()
-        r.ai_target = self.ai_target_edit.text().strip() or "person"
-        r.ai_conf = self.ai_conf_spin.value()
+        r.noise_filter = self.noise.value()
+        r.learn_speed = self.learn_rate.value()
         r.confirm = self.confirm.value()
         r.cooldown = self.cooldown.value()
         r.auto_pause = self.auto_pause_cb.isChecked()
         
+        # 若灵敏度变更，重新初始化提取器
+        if old_sens != r.sensitivity:
+            r.init_subtractor()
+
         self.refresh_combo()
         self.region_combo.setCurrentIndex(i)
         self.update_region_overlay()
@@ -597,7 +572,7 @@ class MainWindow(QMainWindow):
             self.start_btn.setText("停止监控")
             self.status.setText("状态：正在监控屏幕")
             for r in self.regions:
-                r.last_lab = None
+                r.init_subtractor()
                 r.confirm_count = 0
         else:
             self.start_btn.setText("开始监控")
@@ -631,55 +606,34 @@ class MainWindow(QMainWindow):
             return None
 
     def detect_event(self, frame, r):
-        """检测画面变化及 YOLO AI 目标"""
-        motion_triggered = False
+        """优化的混合高斯算法：抗草木晃动、日夜光线变动及阴影剔除"""
+        # 1. MOG2 混合高斯背景提取（混合多模态背景，自动学习摇摆的草木）
+        learning_rate = max(0.001, min(0.1, r.learn_speed))
+        fg_mask = r.subtractor.apply(frame, learningRate=learning_rate)
 
-        # 1. 基础画面变化检测
-        if r.motion:
-            lab = cv2.cvtColor(frame, cv2.COLOR_BGR2Lab)
-            lab = cv2.GaussianBlur(lab, (7, 7), 0)
-            
-            if r.last_lab is not None and r.last_lab.shape == lab.shape:
-                diff = cv2.absdiff(r.last_lab, lab)
-                diff_max = np.max(diff, axis=2)
+        # 2. 剔除地面/画面动态阴影 (MOG2 中 127 为阴影，255 为真正前景)
+        _, fg_mask = cv2.threshold(fg_mask, 200, 255, cv2.THRESH_BINARY)
 
-                mask = np.zeros((r.h, r.w), dtype=np.uint8)
-                cv2.fillPoly(mask, [r.rel_points], 255)
+        # 3. 施加多边形区域掩膜
+        mask = np.zeros((r.h, r.w), dtype=np.uint8)
+        cv2.fillPoly(mask, [r.rel_points], 255)
+        fg_mask = cv2.bitwise_and(fg_mask, fg_mask, mask=mask)
 
-                # 使用原始 mask 进行精确差分分析
-                diff_masked = cv2.bitwise_and(diff_max, diff_max, mask=mask)
+        # 4. 形态学开闭运算：消除高频风吹微小噪点，连接连贯实体目标
+        k_size = max(1, r.noise_filter * 2 - 1)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k_size, k_size))
+        fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, kernel)
+        fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, kernel)
 
-                threshold = max(10, int(45 - r.sensitivity * 0.35))
-                _, th = cv2.threshold(diff_masked, threshold, 255, cv2.THRESH_BINARY)
-                
-                kernel_morph = np.ones((3, 3), np.uint8)
-                th = cv2.morphologyEx(th, cv2.MORPH_OPEN, kernel_morph)
+        # 5. 计算变化面积比例
+        mask_pixels = np.count_nonzero(mask)
+        if mask_pixels == 0:
+            return False
 
-                mask_pixels = np.count_nonzero(mask)
-                if mask_pixels > 0:
-                    ratio = (np.count_nonzero(th) / float(mask_pixels)) * 100.0
-                    motion_triggered = (ratio >= r.min_ratio)
+        changed_pixels = np.count_nonzero(fg_mask)
+        ratio = (changed_pixels / float(mask_pixels)) * 100.0
 
-            r.last_lab = lab
-
-        # 2. YOLO11 AI 目标识别
-        ai_triggered = False
-        if r.use_ai and self.yolo_model is not None:
-            try:
-                results = self.yolo_model.predict(frame, conf=r.ai_conf, verbose=False)
-                if len(results) > 0 and len(results[0].boxes) > 0:
-                    names = results[0].names
-                    target = r.ai_target.lower()
-                    for box in results[0].boxes:
-                        cls_id = int(box.cls[0])
-                        class_name = names.get(cls_id, "").lower()
-                        if target == "all" or target in class_name:
-                            ai_triggered = True
-                            break
-            except Exception:
-                pass
-
-        return motion_triggered or ai_triggered
+        return ratio >= r.min_ratio
 
     def log_event(self, region_name, msg):
         stamp = datetime.now().strftime("%H:%M:%S")
@@ -701,7 +655,7 @@ class MainWindow(QMainWindow):
         self.alarm.play()
         stamp = datetime.now().strftime("%H:%M:%S")
         self.status.setText(f"状态：[{stamp}] {r.name} 触发报警！")
-        self.log_event(r.name, "触发画面变化/AI目标报警")
+        self.log_event(r.name, "检测到显著画面变动")
         self.update_region_overlay()
 
         if r.auto_pause:
