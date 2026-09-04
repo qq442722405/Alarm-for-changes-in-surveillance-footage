@@ -57,6 +57,7 @@ APP_DIR.mkdir(parents=True, exist_ok=True)
 CONFIG_FILE = APP_DIR / "regions.json"
 SNAP_DIR = APP_DIR / "snapshots"
 SNAP_DIR.mkdir(exist_ok=True)
+SCREENSHOT_CONFIG = APP_DIR / "screenshot_config.json"
 
 
 class CollapsibleBox(QWidget):
@@ -209,6 +210,61 @@ class RegionOverlay(QWidget):
             p.drawText(top_pt + QPoint(6, -6 if top_pt.y() > 20 else 20), f"{i+1}. {r.name}")
 
 
+class ScreenshotSelector(QWidget):
+    """单独框选报警截图区域，支持在整个桌面上拖动选择矩形。"""
+    selected = Signal(list)
+
+    def __init__(self, image, left, top):
+        super().__init__()
+        self.left, self.top = left, top
+        self.image = image
+        self.start = None
+        self.end = None
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+        self.setGeometry(left, top, image.width(), image.height())
+        self.setCursor(Qt.CrossCursor)
+        self.setMouseTracking(True)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.start = event.position().toPoint()
+            self.end = self.start
+            self.update()
+
+    def mouseMoveEvent(self, event):
+        if self.start is not None:
+            self.end = event.position().toPoint()
+            self.update()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self.start is not None:
+            self.end = event.position().toPoint()
+            x1, y1 = self.start.x(), self.start.y()
+            x2, y2 = self.end.x(), self.end.y()
+            x, y = min(x1, x2), min(y1, y2)
+            w, h = abs(x2 - x1), abs(y2 - y1)
+            if w >= 20 and h >= 20:
+                self.selected.emit([self.left + x, self.top + y, w, h])
+            self.close()
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            self.close()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.drawImage(0, 0, self.image)
+        p.fillRect(self.rect(), QColor(0, 0, 0, 70))
+        if self.start is not None and self.end is not None:
+            rect = QRect(self.start, self.end).normalized()
+            p.drawImage(rect, self.image.copy(rect))
+            p.setPen(QPen(Qt.red, 3))
+            p.setBrush(Qt.NoBrush)
+            p.drawRect(rect)
+            p.setPen(Qt.white)
+            p.drawText(rect.topLeft() + QPoint(8, -8), f"截图区域 {rect.width()}×{rect.height()}")
+
+
 class Region:
     def __init__(self, data=None):
         d = data or {}
@@ -339,8 +395,16 @@ class MainWindow(QMainWindow):
         self.person_last_detect = {}
         self.person_last_result = {}
 
+        # 报警截图：与监控区域完全独立，默认保存到用户目录下的 snapshots。
+        self.screenshot_enabled = True
+        self.screenshot_rect = None
+        self.screenshot_interval = 5
+        self.last_screenshot_time = 0.0
+        self.load_screenshot_config()
+
         self._build_ui()
         self.auto_load_config()
+        self.update_screenshot_form()
 
         self.show_regions_cb.setChecked(True)
         self.toggle_region_overlay()
@@ -386,6 +450,30 @@ class MainWindow(QMainWindow):
         form_region.addRow("多边形坐标范围", self.pos_label)
         box_region.addLayout(form_region)
         main_layout.addWidget(box_region)
+
+        # 2.5 报警截图设置：截图区域与监控区域独立。
+        box_shot = CollapsibleBox("二、 报警截图画面")
+        shot_btns = QHBoxLayout()
+        self.select_shot_btn = QPushButton("框选截图区域")
+        self.clear_shot_btn = QPushButton("清除截图区域")
+        shot_btns.addWidget(self.select_shot_btn)
+        shot_btns.addWidget(self.clear_shot_btn)
+        box_shot.addLayout(shot_btns)
+        shot_form = QFormLayout()
+        self.screenshot_cb = QCheckBox("报警时自动截图")
+        self.screenshot_interval_spin = QSpinBox()
+        self.screenshot_interval_spin.setRange(1, 3600)
+        self.screenshot_interval_spin.setSuffix(" 秒（两次截图最小间隔）")
+        self.screenshot_path_label = QLabel(str(SNAP_DIR))
+        self.screenshot_path_label.setWordWrap(True)
+        self.screenshot_region_label = QLabel("尚未设置（未设置时不截图）")
+        self.screenshot_region_label.setWordWrap(True)
+        shot_form.addRow("", self.screenshot_cb)
+        shot_form.addRow("截图间隔", self.screenshot_interval_spin)
+        shot_form.addRow("截图区域", self.screenshot_region_label)
+        shot_form.addRow("自动保存位置", self.screenshot_path_label)
+        box_shot.addLayout(shot_form)
+        main_layout.addWidget(box_shot)
 
         # 3. 面板二：算法优化参数（可折叠）
         box_params = CollapsibleBox("二、 画面检测抗干扰参数")
@@ -540,6 +628,10 @@ class MainWindow(QMainWindow):
 
         # 按钮槽函数连接
         self.select_btn.clicked.connect(self.select_region)
+        self.select_shot_btn.clicked.connect(self.select_screenshot_region)
+        self.clear_shot_btn.clicked.connect(self.clear_screenshot_region)
+        self.screenshot_cb.stateChanged.connect(self.apply_screenshot_form)
+        self.screenshot_interval_spin.valueChanged.connect(self.apply_screenshot_form)
         self.del_btn.clicked.connect(self.delete_region)
         self.test_btn.clicked.connect(self.test_alarm)
         self.clear_btn.clicked.connect(self.clear_cache)
@@ -584,6 +676,89 @@ class MainWindow(QMainWindow):
             self.selector.activateWindow()
         except Exception as e:
             QMessageBox.critical(self, "错误", str(e))
+
+    def select_screenshot_region(self):
+        try:
+            image, mon = self.screen_image()
+            self.screenshot_selector = ScreenshotSelector(image, mon["left"], mon["top"])
+            self.screenshot_selector.selected.connect(self.set_screenshot_region)
+            self.screenshot_selector.show()
+            self.screenshot_selector.raise_()
+            self.screenshot_selector.activateWindow()
+        except Exception as e:
+            QMessageBox.critical(self, "错误", str(e))
+
+    def set_screenshot_region(self, rect):
+        self.screenshot_rect = list(map(int, rect))
+        x, y, w, h = self.screenshot_rect
+        self.screenshot_region_label.setText(f"X={x}  Y={y}  W={w}  H={h}")
+        self.save_screenshot_config()
+        self.log_event("截图设置", f"已设置报警截图区域 {w}×{h}")
+
+    def clear_screenshot_region(self):
+        self.screenshot_rect = None
+        self.screenshot_region_label.setText("尚未设置（未设置时不截图）")
+        self.save_screenshot_config()
+
+    def apply_screenshot_form(self):
+        self.screenshot_enabled = self.screenshot_cb.isChecked()
+        self.screenshot_interval = self.screenshot_interval_spin.value()
+        self.save_screenshot_config()
+
+    def save_screenshot_config(self):
+        try:
+            SCREENSHOT_CONFIG.write_text(json.dumps({
+                "enabled": self.screenshot_enabled,
+                "rect": self.screenshot_rect,
+                "interval": self.screenshot_interval
+            }, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    def load_screenshot_config(self):
+        try:
+            if SCREENSHOT_CONFIG.exists():
+                d = json.loads(SCREENSHOT_CONFIG.read_text(encoding="utf-8"))
+                self.screenshot_enabled = bool(d.get("enabled", True))
+                rect = d.get("rect")
+                self.screenshot_rect = list(map(int, rect)) if isinstance(rect, list) and len(rect) == 4 else None
+                self.screenshot_interval = max(1, int(d.get("interval", 5)))
+        except Exception:
+            pass
+
+    def update_screenshot_form(self):
+        self.screenshot_cb.blockSignals(True)
+        self.screenshot_interval_spin.blockSignals(True)
+        self.screenshot_cb.setChecked(self.screenshot_enabled)
+        self.screenshot_interval_spin.setValue(self.screenshot_interval)
+        if self.screenshot_rect:
+            x, y, w, h = self.screenshot_rect
+            self.screenshot_region_label.setText(f"X={x}  Y={y}  W={w}  H={h}")
+        else:
+            self.screenshot_region_label.setText("尚未设置（未设置时不截图）")
+        self.screenshot_cb.blockSignals(False)
+        self.screenshot_interval_spin.blockSignals(False)
+
+    def capture_alarm_screenshot(self, reason=""):
+        """按独立截图区域保存报警截图；受截图间隔限制，不影响报警冷却。"""
+        if not self.screenshot_enabled or not self.screenshot_rect:
+            return None
+        now = time.time()
+        if now - self.last_screenshot_time < self.screenshot_interval:
+            return None
+        x, y, w, h = self.screenshot_rect
+        if w < 20 or h < 20:
+            return None
+        try:
+            shot = np.array(self.sct.grab({"left": x, "top": y, "width": w, "height": h}))
+            frame = cv2.cvtColor(shot, cv2.COLOR_BGRA2BGR)
+            filename = SNAP_DIR / (datetime.now().strftime("%Y%m%d_%H%M%S_%f") + "_报警.jpg")
+            if cv2.imwrite(str(filename), frame, [int(cv2.IMWRITE_JPEG_QUALITY), 92]):
+                self.last_screenshot_time = now
+                return filename
+        except Exception:
+            pass
+        return None
 
     def add_region(self, points):
         r = Region({
@@ -984,16 +1159,15 @@ class MainWindow(QMainWindow):
             return False
         r.last_event = now
 
-        try:
-            filename = SNAP_DIR / (datetime.now().strftime("%Y%m%d_%H%M%S_%f") + ".jpg")
-            cv2.imwrite(str(filename), frame)
-        except Exception:
-            pass
+        # 报警截图使用单独框选的区域，而不是监控检测区域。
+        screenshot_file = self.capture_alarm_screenshot(reason)
 
         self.alarm.play()
         stamp = datetime.now().strftime("%H:%M:%S")
         self.status.setText(f"状态：[{stamp}] {r.name} 触发报警！")
         self.log_event(r.name, reason)
+        if screenshot_file:
+            self.log_event(r.name, f"已保存报警截图：{screenshot_file}")
         self.update_region_overlay()
 
         if r.auto_pause:
