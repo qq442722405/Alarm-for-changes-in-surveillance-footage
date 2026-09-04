@@ -40,6 +40,10 @@ sys.excepthook = handle_exception
 import cv2
 import mss
 import numpy as np
+try:
+    from ultralytics import YOLO
+except Exception:
+    YOLO = None
 from PySide6.QtCore import Qt, QRect, QPoint, QTimer, Signal, QObject
 from PySide6.QtGui import QImage, QPixmap, QPainter, QPen, QIcon, QPolygon, QColor
 from PySide6.QtWidgets import (
@@ -220,7 +224,24 @@ class Region:
         self.confirm = int(d.get("confirm", 3))
         self.cooldown = int(d.get("cooldown", 10))
         self.auto_pause = bool(d.get("auto_pause", False))
-        
+
+        # 可独立开启的“人员检测”开关。
+        # 与画面变化检测相互独立：即使人物走得很慢、穿黑衣导致画面变化面积很小，
+        # 只要 YOLO 识别到 person，也可以直接进入报警确认流程。
+        self.person_enabled = bool(d.get("person_enabled", False))
+        self.person_conf = float(d.get("person_conf", 0.20))
+        self.person_interval = float(d.get("person_interval", 0.8))
+
+        # 画面变化检测调试开关：可以分别关闭/打开不同处理环节，方便现场逐项测试。
+        self.motion_enabled = bool(d.get("motion_enabled", True))
+        self.frame_diff_enabled = bool(d.get("frame_diff_enabled", True))
+        self.mog2_enabled = bool(d.get("mog2_enabled", True))
+        self.shadow_filter = bool(d.get("shadow_filter", True))
+        self.morph_enabled = bool(d.get("morph_enabled", True))
+        self.background_learning = bool(d.get("background_learning", True))
+        self.pixel_threshold = int(d.get("pixel_threshold", 25))
+        self.min_blob_ratio = float(d.get("min_blob_ratio", 0.05))
+
         self.points = d.get("points", [])
         if not self.points and "x" in d:
             x, y, w, h = d.get("x", 0), d.get("y", 0), d.get("w", 300), d.get("h", 200)
@@ -228,6 +249,14 @@ class Region:
 
         self.confirm_count = 0
         self.last_event = 0.0
+        self.raw_ratio = 0.0
+        self.display_ratio = 0.0
+        self.preview_original = None
+        self.preview_raw = np.zeros((10, 10), dtype=np.uint8)
+        self.preview_processed = np.zeros((10, 10), dtype=np.uint8)
+        self.preview_boxes = []
+        self.preview_person_boxes = []
+        self.preview_motion = False
         self._update_bounds()
         self.init_subtractor()
 
@@ -252,6 +281,7 @@ class Region:
             varThreshold=var_threshold,
             detectShadows=True
         )
+        self.last_gray = None
 
     def to_dict(self):
         return {
@@ -264,6 +294,17 @@ class Region:
             "confirm": self.confirm,
             "cooldown": self.cooldown,
             "auto_pause": self.auto_pause,
+            "person_enabled": self.person_enabled,
+            "person_conf": self.person_conf,
+            "person_interval": self.person_interval,
+            "motion_enabled": self.motion_enabled,
+            "frame_diff_enabled": self.frame_diff_enabled,
+            "mog2_enabled": self.mog2_enabled,
+            "shadow_filter": self.shadow_filter,
+            "morph_enabled": self.morph_enabled,
+            "background_learning": self.background_learning,
+            "pixel_threshold": self.pixel_threshold,
+            "min_blob_ratio": self.min_blob_ratio,
             "points": self.points
         }
 
@@ -290,6 +331,13 @@ class MainWindow(QMainWindow):
         self.sct = mss.mss()
         self.alarm = Alarm()
         self.region_overlay = RegionOverlay(self)
+
+        # YOLO 人员检测：首次启用时懒加载，模型已随工程打包，默认不需要联网下载。
+        self.person_model = None
+        self.person_model_loading = False
+        self.person_model_error = ""
+        self.person_last_detect = {}
+        self.person_last_result = {}
 
         self._build_ui()
         self.auto_load_config()
@@ -364,6 +412,27 @@ class MainWindow(QMainWindow):
         self.learn_rate.setDecimals(3)
         self.learn_rate.setToolTip("调整光线渐变适应速度（如云影过境、白天黑夜切换）")
 
+        # 画面变化检测的独立调试开关
+        self.motion_cb = QCheckBox("启用画面变化检测")
+        self.frame_diff_cb = QCheckBox("启用相邻帧差分")
+        self.mog2_cb = QCheckBox("启用背景模型（MOG2）")
+        self.shadow_cb = QCheckBox("过滤阴影")
+        self.morph_cb = QCheckBox("启用形态学去噪")
+        self.learn_cb = QCheckBox("启用自适应背景学习")
+
+        self.pixel_threshold = QSpinBox()
+        self.pixel_threshold.setRange(1, 100)
+        self.pixel_threshold.setValue(25)
+        self.pixel_threshold.setSuffix(" 灰度差")
+        self.pixel_threshold.setToolTip("越小越敏感，越容易把小变化/噪声算进去")
+
+        self.min_blob = QDoubleSpinBox()
+        self.min_blob.setRange(0.01, 10.0)
+        self.min_blob.setSingleStep(0.01)
+        self.min_blob.setDecimals(2)
+        self.min_blob.setSuffix(" %")
+        self.min_blob.setToolTip("过滤很小的变化块；越小越容易保留小目标")
+
         self.confirm = QSpinBox()
         self.confirm.setRange(1, 30)
 
@@ -374,6 +443,14 @@ class MainWindow(QMainWindow):
         self.auto_pause_cb = QCheckBox("报警后自动暂停监控")
 
         form_params.addRow("", self.enable_cb)
+        form_params.addRow("", self.motion_cb)
+        form_params.addRow("", self.frame_diff_cb)
+        form_params.addRow("", self.mog2_cb)
+        form_params.addRow("", self.shadow_cb)
+        form_params.addRow("", self.morph_cb)
+        form_params.addRow("", self.learn_cb)
+        form_params.addRow("变化像素阈值", self.pixel_threshold)
+        form_params.addRow("最小变化块面积", self.min_blob)
         form_params.addRow("动静灵敏度", self.sens)
         form_params.addRow("触发变化面积", self.ratio)
         form_params.addRow("抗草木抖动等级", self.noise)
@@ -382,13 +459,37 @@ class MainWindow(QMainWindow):
         form_params.addRow("报警冷却", self.cooldown)
         form_params.addRow("", self.auto_pause_cb)
 
+        # 人员检测开关：用户可以单独打开测试，不影响原来的画面变化算法。
+        self.person_cb = QCheckBox("启用人员检测（YOLO，推荐测试）")
+        self.person_conf_spin = QDoubleSpinBox()
+        self.person_conf_spin.setRange(0.05, 0.95)
+        self.person_conf_spin.setSingleStep(0.05)
+        self.person_conf_spin.setDecimals(2)
+        self.person_conf_spin.setSuffix(" 置信度")
+        self.person_interval_spin = QDoubleSpinBox()
+        self.person_interval_spin.setRange(0.2, 5.0)
+        self.person_interval_spin.setSingleStep(0.1)
+        self.person_interval_spin.setDecimals(1)
+        self.person_interval_spin.setSuffix(" 秒/次")
+        self.person_status = QLabel("人员检测：未启用")
+        self.person_status.setStyleSheet("color:#555;")
+
+        form_params.addRow("", self.person_cb)
+        form_params.addRow("人员识别最低置信度", self.person_conf_spin)
+        form_params.addRow("人员识别间隔", self.person_interval_spin)
+        form_params.addRow("", self.person_status)
+
         box_params.addLayout(form_params)
         main_layout.addWidget(box_params)
 
         # 绑定参数控制事件
-        for w in [self.enable_cb, self.auto_pause_cb]:
+        for w in [self.enable_cb, self.motion_cb, self.frame_diff_cb, self.mog2_cb,
+                  self.shadow_cb, self.morph_cb, self.learn_cb, self.auto_pause_cb, self.person_cb]:
             w.stateChanged.connect(self.apply_form)
-        for w in [self.sens, self.ratio, self.noise, self.learn_rate, self.confirm, self.cooldown]:
+        for w in [self.sens, self.ratio, self.noise, self.learn_rate, self.pixel_threshold,
+                  self.min_blob, self.confirm, self.cooldown]:
+            w.valueChanged.connect(self.apply_form)
+        for w in [self.person_conf_spin, self.person_interval_spin]:
             w.valueChanged.connect(self.apply_form)
 
         # 4. 面板三：实时控制与状态（可折叠）
@@ -407,7 +508,30 @@ class MainWindow(QMainWindow):
         box_control.addWidget(self.status)
         main_layout.addWidget(box_control)
 
-        # 5. 面板四：报警日志记录（可折叠）
+        # 4. 实时识别效果预览：显示原始画面、前景掩膜、去噪结果以及人员框。
+        box_preview = CollapsibleBox("四、 实时识别效果（调试）")
+        preview_top = QHBoxLayout()
+        self.preview_cb = QCheckBox("开启实时识别效果预览")
+        self.preview_cb.setChecked(True)
+        self.preview_mode = QComboBox()
+        self.preview_mode.addItems(["处理后画面", "原始画面", "前景掩膜", "去噪后掩膜", "人员检测框"])
+        preview_top.addWidget(self.preview_cb)
+        preview_top.addWidget(QLabel("显示："))
+        preview_top.addWidget(self.preview_mode)
+        box_preview.addLayout(preview_top)
+        self.preview_label = QLabel("等待开始监控……")
+        self.preview_label.setAlignment(Qt.AlignCenter)
+        self.preview_label.setMinimumHeight(240)
+        self.preview_label.setStyleSheet("background:#101418; color:#aaa; border:1px solid #444; padding:4px;")
+        box_preview.addWidget(self.preview_label)
+        self.preview_info = QLabel("实时效果：未运行")
+        self.preview_info.setStyleSheet("color:#555;")
+        box_preview.addWidget(self.preview_info)
+        self.preview_cb.stateChanged.connect(self.update_preview_visibility)
+        self.preview_mode.currentIndexChanged.connect(self.refresh_preview)
+        main_layout.addWidget(box_preview)
+
+        # 5. 面板五：报警日志记录（可折叠）
         box_log = CollapsibleBox("四、 报警日志记录")
         self.log_list = QListWidget()
         self.log_list.setMaximumHeight(120)
@@ -488,12 +612,23 @@ class MainWindow(QMainWindow):
             r = self.regions[idx]
             self.pos_label.setText(f"范围: {r.w}×{r.h} (X={r.x}, Y={r.y})")
             
-            widgets = [self.enable_cb, self.sens, self.ratio, self.noise,
-                       self.learn_rate, self.confirm, self.cooldown, self.auto_pause_cb]
+            widgets = [self.enable_cb, self.motion_cb, self.frame_diff_cb, self.mog2_cb,
+                       self.shadow_cb, self.morph_cb, self.learn_cb, self.pixel_threshold,
+                       self.min_blob, self.sens, self.ratio, self.noise, self.learn_rate,
+                       self.confirm, self.cooldown, self.auto_pause_cb,
+                       self.person_cb, self.person_conf_spin, self.person_interval_spin]
             for w in widgets:
                 w.blockSignals(True)
 
             self.enable_cb.setChecked(r.enabled)
+            self.motion_cb.setChecked(r.motion_enabled)
+            self.frame_diff_cb.setChecked(r.frame_diff_enabled)
+            self.mog2_cb.setChecked(r.mog2_enabled)
+            self.shadow_cb.setChecked(r.shadow_filter)
+            self.morph_cb.setChecked(r.morph_enabled)
+            self.learn_cb.setChecked(r.background_learning)
+            self.pixel_threshold.setValue(r.pixel_threshold)
+            self.min_blob.setValue(r.min_blob_ratio)
             self.sens.setValue(r.sensitivity)
             self.ratio.setValue(r.min_ratio)
             self.noise.setValue(r.noise_filter)
@@ -501,6 +636,12 @@ class MainWindow(QMainWindow):
             self.confirm.setValue(r.confirm)
             self.cooldown.setValue(r.cooldown)
             self.auto_pause_cb.setChecked(r.auto_pause)
+            self.person_cb.setChecked(r.person_enabled)
+            self.person_conf_spin.setValue(r.person_conf)
+            self.person_interval_spin.setValue(r.person_interval)
+            self.person_status.setText(
+                "人员检测：已开启（模型将在监控时加载）" if r.person_enabled else "人员检测：未启用"
+            )
 
             for w in widgets:
                 w.blockSignals(False)
@@ -511,6 +652,14 @@ class MainWindow(QMainWindow):
             return
         r = self.regions[i]
         r.enabled = self.enable_cb.isChecked()
+        r.motion_enabled = self.motion_cb.isChecked()
+        r.frame_diff_enabled = self.frame_diff_cb.isChecked()
+        r.mog2_enabled = self.mog2_cb.isChecked()
+        r.shadow_filter = self.shadow_cb.isChecked()
+        r.morph_enabled = self.morph_cb.isChecked()
+        r.background_learning = self.learn_cb.isChecked()
+        r.pixel_threshold = self.pixel_threshold.value()
+        r.min_blob_ratio = self.min_blob.value()
         
         old_sens = r.sensitivity
         r.sensitivity = self.sens.value()
@@ -605,42 +754,231 @@ class MainWindow(QMainWindow):
         except Exception:
             return None
 
-    def detect_event(self, frame, r):
-        """优化的混合高斯算法：抗草木晃动、日夜光线变动及阴影剔除"""
-        # 1. MOG2 混合高斯背景提取（混合多模态背景，自动学习摇摆的草木）
-        learning_rate = max(0.001, min(0.1, r.learn_speed))
-        fg_mask = r.subtractor.apply(frame, learningRate=learning_rate)
+    def ensure_person_model(self):
+        """加载随工程打包的 YOLO 人员检测模型。"""
+        if self.person_model is not None:
+            return True
+        if self.person_model_loading:
+            return False
+        self.person_model_loading = True
+        try:
+            if YOLO is None:
+                raise RuntimeError("ultralytics 未正确安装")
+            model_path = resource_path("yolo11n.pt")
+            if not model_path.exists():
+                raise FileNotFoundError(f"找不到人员检测模型：{model_path}")
+            self.person_status.setText("人员检测：正在加载 YOLO 模型……")
+            self.person_model = YOLO(str(model_path))
+            self.person_status.setText("人员检测：模型已加载")
+            self.person_model_error = ""
+            return True
+        except Exception as e:
+            self.person_model_error = str(e)
+            self.person_status.setText(f"人员检测失败：{str(e)[:60]}")
+            self.person_model = None
+            return False
+        finally:
+            self.person_model_loading = False
 
-        # 2. 剔除地面/画面动态阴影 (MOG2 中 127 为阴影，255 为真正前景)
-        _, fg_mask = cv2.threshold(fg_mask, 200, 255, cv2.THRESH_BINARY)
-
-        # 3. 施加多边形区域掩膜
-        mask = np.zeros((r.h, r.w), dtype=np.uint8)
-        cv2.fillPoly(mask, [r.rel_points], 255)
-        fg_mask = cv2.bitwise_and(fg_mask, fg_mask, mask=mask)
-
-        # 4. 形态学开闭运算：消除高频风吹微小噪点，连接连贯实体目标
-        k_size = max(1, r.noise_filter * 2 - 1)
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k_size, k_size))
-        fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, kernel)
-        fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, kernel)
-
-        # 5. 计算变化面积比例
-        mask_pixels = np.count_nonzero(mask)
-        if mask_pixels == 0:
+    def detect_person(self, frame, r):
+        """
+        独立人员检测。
+        只识别 COCO 的 person 类别，不依赖画面变化面积。
+        因此慢走、黑衣、背景颜色接近时，也有机会单独触发报警。
+        """
+        if not r.person_enabled:
             return False
 
-        changed_pixels = np.count_nonzero(fg_mask)
-        ratio = (changed_pixels / float(mask_pixels)) * 100.0
+        now = time.time()
+        key = id(r)
+        last = self.person_last_detect.get(key, 0.0)
+        if now - last < max(0.2, r.person_interval):
+            return bool(self.person_last_result.get(key, False))
+        self.person_last_detect[key] = now
 
-        return ratio >= r.min_ratio
+        if not self.ensure_person_model():
+            self.person_last_result[key] = False
+            return False
+
+        try:
+            # 适当降低输入尺寸，保证车机/普通 CPU 上不会过慢。
+            results = self.person_model.predict(
+                source=frame,
+                conf=max(0.05, min(0.95, r.person_conf)),
+                classes=[0],
+                imgsz=640,
+                verbose=False,
+                device="cpu"
+            )
+            found = False
+            person_boxes = []
+            if results:
+                boxes = results[0].boxes
+                if boxes is not None and len(boxes) > 0:
+                    poly = r.rel_points
+                    xyxys = boxes.xyxy.cpu().numpy()
+                    confs = boxes.conf.cpu().numpy() if boxes.conf is not None else np.zeros(len(xyxys))
+                    for idx, xyxy in enumerate(xyxys):
+                        x1, y1, x2, y2 = [int(v) for v in xyxy[:4]]
+                        x1 = max(0, min(r.w - 1, x1))
+                        y1 = max(0, min(r.h - 1, y1))
+                        x2 = max(0, min(r.w - 1, x2))
+                        y2 = max(0, min(r.h - 1, y2))
+                        if x2 <= x1 or y2 <= y1:
+                            continue
+
+                        # 判断人员框与四点区域的重叠：只要人员框有明显部分进入区域即可。
+                        box_mask = np.zeros((r.h, r.w), dtype=np.uint8)
+                        cv2.rectangle(box_mask, (x1, y1), (x2, y2), 255, -1)
+                        roi_mask = np.zeros((r.h, r.w), dtype=np.uint8)
+                        cv2.fillPoly(roi_mask, [poly], 255)
+                        inter = cv2.countNonZero(cv2.bitwise_and(box_mask, roi_mask))
+                        box_area = max(1, cv2.countNonZero(box_mask))
+                        conf = float(confs[idx]) if idx < len(confs) else 0.0
+                        if inter / float(box_area) >= 0.05:
+                            found = True
+                        person_boxes.append((x1, y1, x2, y2, conf))
+
+            r.preview_person_boxes = person_boxes
+            self.person_last_result[key] = found
+            self.person_status.setText(
+                "人员检测：检测到人员" if found else "人员检测：运行中，未检测到人员"
+            )
+            return found
+        except Exception as e:
+            self.person_last_result[key] = False
+            self.person_status.setText(f"人员识别异常：{str(e)[:60]}")
+            return False
+
+    def detect_event(self, frame, r):
+        """可调试的画面变化检测。返回触发结果，并保存各阶段图像供实时预览。"""
+        h, w = frame.shape[:2]
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (5, 5), 0)
+
+        roi_mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.fillPoly(roi_mask, [r.rel_points], 255)
+        raw_mask = np.zeros((h, w), dtype=np.uint8)
+        masks = []
+
+        threshold = max(1, int(r.pixel_threshold))
+
+        if r.frame_diff_enabled and r.last_gray is not None:
+            diff = cv2.absdiff(r.last_gray, gray)
+            _, frame_mask = cv2.threshold(diff, threshold, 255, cv2.THRESH_BINARY)
+            masks.append(frame_mask)
+        r.last_gray = gray.copy()
+
+        if r.mog2_enabled:
+            lr = r.learn_speed if r.background_learning else 0.0
+            fg = r.subtractor.apply(frame, learningRate=lr)
+            if r.shadow_filter:
+                _, fg = cv2.threshold(fg, 200, 255, cv2.THRESH_BINARY)
+            else:
+                _, fg = cv2.threshold(fg, 20, 255, cv2.THRESH_BINARY)
+            masks.append(fg)
+
+        if masks:
+            # 两种检测方式取并集，避免单一算法漏掉慢走/黑衣等目标。
+            raw_mask = masks[0].copy()
+            for m in masks[1:]:
+                raw_mask = cv2.bitwise_or(raw_mask, m)
+            raw_mask = cv2.bitwise_and(raw_mask, roi_mask)
+
+        processed = raw_mask.copy()
+        if r.morph_enabled and np.any(processed):
+            k_size = max(1, r.noise_filter * 2 - 1)
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
+            processed = cv2.morphologyEx(processed, cv2.MORPH_OPEN, kernel)
+            processed = cv2.morphologyEx(processed, cv2.MORPH_CLOSE, kernel)
+
+        # 过滤过小连通块，保留真正有意义的变化区域。
+        min_blob_px = max(4, int(w * h * r.min_blob_ratio / 100.0))
+        filtered = np.zeros_like(processed)
+        contours, _ = cv2.findContours(processed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        valid_area = 0
+        boxes = []
+        for c in contours:
+            area = cv2.contourArea(c)
+            if area >= min_blob_px:
+                cv2.drawContours(filtered, [c], -1, 255, -1)
+                valid_area += area
+                boxes.append(cv2.boundingRect(c))
+
+        roi_pixels = max(1, cv2.countNonZero(roi_mask))
+        ratio = valid_area / float(roi_pixels) * 100.0
+        r.raw_ratio = ratio
+        r.display_ratio = r.display_ratio * 0.72 + ratio * 0.28
+
+        # 保存调试画面。
+        r.preview_original = frame.copy()
+        r.preview_raw = raw_mask.copy()
+        r.preview_processed = filtered.copy()
+        r.preview_boxes = boxes
+        r.preview_motion = bool(r.motion_enabled and r.display_ratio >= r.min_ratio)
+        return r.preview_motion if r.motion_enabled else False
+
+    def make_preview(self, r, person_boxes=None):
+        """生成实时识别效果图：原图/前景/去噪/人员框/处理后。"""
+        if not hasattr(r, 'preview_original'):
+            return None
+        mode = self.preview_mode.currentIndex()
+        original = r.preview_original.copy()
+        if mode == 1:
+            img = original
+        elif mode == 2:
+            img = cv2.cvtColor(r.preview_raw, cv2.COLOR_GRAY2BGR)
+        elif mode == 3:
+            img = cv2.cvtColor(r.preview_processed, cv2.COLOR_GRAY2BGR)
+        else:
+            img = original.copy()
+            for x, y, w, h in getattr(r, 'preview_boxes', []):
+                cv2.rectangle(img, (x, y), (x+w, y+h), (0, 255, 255), 2)
+            for x1, y1, x2, y2, conf in (person_boxes or []):
+                cv2.rectangle(img, (x1, y1), (x2, y2), (0, 0, 255), 3)
+                cv2.putText(img, f"PERSON {conf:.2f}", (x1, max(20, y1-8)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, cv2.LINE_AA)
+
+        # 在预览图上标注当前检测状态。
+        cv2.putText(img, f"change: {getattr(r, 'display_ratio', 0.0):.2f}% / {r.min_ratio:.2f}%",
+                    (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (0, 255, 255), 2, cv2.LINE_AA)
+        if getattr(r, 'preview_motion', False):
+            cv2.putText(img, "MOTION", (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2, cv2.LINE_AA)
+        if person_boxes:
+            cv2.putText(img, f"PERSON: {len(person_boxes)}", (10, 78), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2, cv2.LINE_AA)
+        return img
+
+    def refresh_preview(self):
+        if not self.preview_cb.isChecked():
+            return
+        if 0 <= self.selected_index < len(self.regions):
+            r = self.regions[self.selected_index]
+            boxes = getattr(r, 'preview_person_boxes', [])
+            img = self.make_preview(r, boxes)
+            if img is not None:
+                self.set_preview_image(img)
+
+    def set_preview_image(self, img):
+        if img is None or not self.preview_cb.isChecked():
+            return
+        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        h, w = rgb.shape[:2]
+        qimg = QImage(rgb.data, w, h, 3*w, QImage.Format_RGB888).copy()
+        pix = QPixmap.fromImage(qimg)
+        self.preview_label.setPixmap(pix.scaled(self.preview_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+
+    def update_preview_visibility(self):
+        self.preview_label.setVisible(self.preview_cb.isChecked())
+        self.preview_info.setVisible(self.preview_cb.isChecked())
+        if self.preview_cb.isChecked():
+            self.refresh_preview()
 
     def log_event(self, region_name, msg):
         stamp = datetime.now().strftime("%H:%M:%S")
         self.log_list.addItem(QListWidgetItem(f"[{stamp}] {region_name}: {msg}"))
         self.log_list.scrollToBottom()
 
-    def trigger_alarm(self, r, frame):
+    def trigger_alarm(self, r, frame, reason="检测到显著画面变动"):
         now = time.time()
         if now - r.last_event < r.cooldown:
             return False
@@ -655,7 +993,7 @@ class MainWindow(QMainWindow):
         self.alarm.play()
         stamp = datetime.now().strftime("%H:%M:%S")
         self.status.setText(f"状态：[{stamp}] {r.name} 触发报警！")
-        self.log_event(r.name, "检测到显著画面变动")
+        self.log_event(r.name, reason)
         self.update_region_overlay()
 
         if r.auto_pause:
@@ -676,15 +1014,37 @@ class MainWindow(QMainWindow):
             if frame is None or frame.size == 0:
                 continue
 
-            triggered = self.detect_event(frame, r)
+            motion_triggered = self.detect_event(frame, r) if r.motion_enabled else False
+            person_triggered = self.detect_person(frame, r)
+            r.preview_person_boxes = getattr(r, 'preview_person_boxes', [])
 
-            if triggered:
+            is_selected = 0 <= self.selected_index < len(self.regions) and r is self.regions[self.selected_index]
+            if is_selected and self.preview_cb.isChecked():
+                    img = self.make_preview(r, r.preview_person_boxes)
+                    self.set_preview_image(img)
+                    self.preview_info.setText(
+                        f"区域：{r.name} ｜ 画面变化：{r.display_ratio:.2f}% ｜ 阈值：{r.min_ratio:.2f}% ｜ "
+                        f"人员：{'已检测到' if person_triggered else '未检测到'}"
+                    )
+
+            # 人员检测可以独立报警；画面变化仍然按原来的连续确认帧逻辑。
+            if person_triggered:
+                r.confirm_count += 1
+            elif motion_triggered:
                 r.confirm_count += 1
             else:
                 r.confirm_count = 0
 
-            if r.confirm_count >= r.confirm:
-                self.trigger_alarm(r, frame)
+            # 人员检测开启时单独采用人员确认帧，默认可快速验证。
+            needed = 1 if person_triggered else r.confirm
+            if r.confirm_count >= needed:
+                if person_triggered and motion_triggered:
+                    reason = "检测到人员 + 画面显著变化"
+                elif person_triggered:
+                    reason = "检测到人员（YOLO）"
+                else:
+                    reason = "检测到显著画面变动"
+                self.trigger_alarm(r, frame, reason)
                 r.confirm_count = 0
 
     def auto_save_config(self):
