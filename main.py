@@ -49,7 +49,7 @@ from PySide6.QtGui import QImage, QPixmap, QPainter, QPen, QIcon, QPolygon, QCol
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QPushButton, QLabel, QComboBox,
     QVBoxLayout, QHBoxLayout, QFormLayout, QGroupBox, QSpinBox, QDoubleSpinBox,
-    QCheckBox, QMessageBox, QScrollArea, QToolButton, QListWidget, QListWidgetItem
+    QCheckBox, QMessageBox, QFileDialog, QScrollArea, QToolButton, QListWidget, QListWidgetItem, QSizePolicy
 )
 
 APP_DIR = Path.home() / ".screen_monitor_ai"
@@ -58,6 +58,7 @@ CONFIG_FILE = APP_DIR / "regions.json"
 SNAP_DIR = APP_DIR / "snapshots"
 SNAP_DIR.mkdir(exist_ok=True)
 SCREENSHOT_CONFIG = APP_DIR / "screenshot_config.json"
+APP_CONFIG = APP_DIR / "app_config.json"
 
 
 class CollapsibleBox(QWidget):
@@ -399,6 +400,7 @@ class MainWindow(QMainWindow):
         self.screenshot_enabled = True
         self.screenshot_rect = None
         self.screenshot_interval = 5
+        self.screenshot_dir = SNAP_DIR
         self.last_screenshot_time = 0.0
         self.load_screenshot_config()
 
@@ -464,14 +466,18 @@ class MainWindow(QMainWindow):
         self.screenshot_interval_spin = QSpinBox()
         self.screenshot_interval_spin.setRange(1, 3600)
         self.screenshot_interval_spin.setSuffix(" 秒（两次截图最小间隔）")
-        self.screenshot_path_label = QLabel(str(SNAP_DIR))
+        self.screenshot_path_label = QLabel(str(self.screenshot_dir))
         self.screenshot_path_label.setWordWrap(True)
+        self.select_screenshot_path_btn = QPushButton("选择保存位置")
         self.screenshot_region_label = QLabel("尚未设置（未设置时不截图）")
         self.screenshot_region_label.setWordWrap(True)
         shot_form.addRow("", self.screenshot_cb)
         shot_form.addRow("截图间隔", self.screenshot_interval_spin)
         shot_form.addRow("截图区域", self.screenshot_region_label)
-        shot_form.addRow("自动保存位置", self.screenshot_path_label)
+        path_layout = QHBoxLayout()
+        path_layout.addWidget(self.screenshot_path_label, 1)
+        path_layout.addWidget(self.select_screenshot_path_btn)
+        shot_form.addRow("截图保存位置", path_layout)
         box_shot.addLayout(shot_form)
         main_layout.addWidget(box_shot)
 
@@ -609,7 +615,10 @@ class MainWindow(QMainWindow):
         box_preview.addLayout(preview_top)
         self.preview_label = QLabel("等待开始监控……")
         self.preview_label.setAlignment(Qt.AlignCenter)
-        self.preview_label.setMinimumHeight(240)
+        self.preview_label.setMinimumSize(320, 220)
+        self.preview_label.setMaximumHeight(360)
+        self.preview_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.preview_label.setScaledContents(False)
         self.preview_label.setStyleSheet("background:#101418; color:#aaa; border:1px solid #444; padding:4px;")
         box_preview.addWidget(self.preview_label)
         self.preview_info = QLabel("实时效果：未运行")
@@ -638,6 +647,23 @@ class MainWindow(QMainWindow):
         self.start_btn.clicked.connect(self.toggle_monitor)
         self.pause_btn.clicked.connect(self.toggle_pause)
         self.show_regions_cb.stateChanged.connect(self.toggle_region_overlay)
+        self.select_screenshot_path_btn.clicked.connect(self.select_screenshot_path)
+
+        # 配置管理：手动保存 / 恢复默认配置。
+        box_config = CollapsibleBox("六、 配置管理")
+        config_btns = QHBoxLayout()
+        self.save_config_btn = QPushButton("保存配置")
+        self.reset_config_btn = QPushButton("配置重置")
+        config_btns.addWidget(self.save_config_btn)
+        config_btns.addWidget(self.reset_config_btn)
+        box_config.addLayout(config_btns)
+        self.config_info = QLabel("程序运行中会自动保存；也可以手动保存。")
+        self.config_info.setStyleSheet("color:#555;")
+        box_config.addWidget(self.config_info)
+        main_layout.addWidget(box_config)
+
+        self.save_config_btn.clicked.connect(self.manual_save_config)
+        self.reset_config_btn.clicked.connect(self.reset_all_config)
 
         main_layout.addStretch()
 
@@ -710,7 +736,8 @@ class MainWindow(QMainWindow):
             SCREENSHOT_CONFIG.write_text(json.dumps({
                 "enabled": self.screenshot_enabled,
                 "rect": self.screenshot_rect,
-                "interval": self.screenshot_interval
+                "interval": self.screenshot_interval,
+                "save_dir": str(self.screenshot_dir)
             }, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception:
             pass
@@ -723,12 +750,17 @@ class MainWindow(QMainWindow):
                 rect = d.get("rect")
                 self.screenshot_rect = list(map(int, rect)) if isinstance(rect, list) and len(rect) == 4 else None
                 self.screenshot_interval = max(1, int(d.get("interval", 5)))
+                save_dir = d.get("save_dir")
+                if save_dir:
+                    self.screenshot_dir = Path(save_dir)
+                    self.screenshot_dir.mkdir(parents=True, exist_ok=True)
         except Exception:
             pass
 
     def update_screenshot_form(self):
         self.screenshot_cb.blockSignals(True)
         self.screenshot_interval_spin.blockSignals(True)
+        self.screenshot_path_label.setText(str(self.screenshot_dir))
         self.screenshot_cb.setChecked(self.screenshot_enabled)
         self.screenshot_interval_spin.setValue(self.screenshot_interval)
         if self.screenshot_rect:
@@ -752,13 +784,62 @@ class MainWindow(QMainWindow):
         try:
             shot = np.array(self.sct.grab({"left": x, "top": y, "width": w, "height": h}))
             frame = cv2.cvtColor(shot, cv2.COLOR_BGRA2BGR)
-            filename = SNAP_DIR / (datetime.now().strftime("%Y%m%d_%H%M%S_%f") + "_报警.jpg")
+            self.screenshot_dir.mkdir(parents=True, exist_ok=True)
+            filename = self.screenshot_dir / (datetime.now().strftime("%Y%m%d_%H%M%S_%f") + "_报警.jpg")
             if cv2.imwrite(str(filename), frame, [int(cv2.IMWRITE_JPEG_QUALITY), 92]):
                 self.last_screenshot_time = now
                 return filename
         except Exception:
             pass
         return None
+
+    def select_screenshot_path(self):
+        path = QFileDialog.getExistingDirectory(self, "选择报警截图保存文件夹", str(self.screenshot_dir))
+        if path:
+            self.screenshot_dir = Path(path)
+            try:
+                self.screenshot_dir.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+            self.screenshot_path_label.setText(str(self.screenshot_dir))
+            self.save_screenshot_config()
+            self.log_event("截图设置", f"报警截图保存位置：{self.screenshot_dir}")
+
+    def manual_save_config(self):
+        self.apply_screenshot_form()
+        self.auto_save_config()
+        self.save_screenshot_config()
+        self.config_info.setText(f"配置已保存：{datetime.now().strftime('%H:%M:%S')}")
+
+    def reset_all_config(self):
+        reply = QMessageBox.question(
+            self, "确认重置",
+            "确定要恢复全部配置为默认值吗？\n监控区域、截图区域和检测参数都会恢复默认。",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+        self.running = False
+        self.start_btn.setText("开始监控")
+        self.pause_btn.setText("暂停")
+        self.status.setText("状态：未监控")
+        self.regions = []
+        self.selected_index = -1
+        self.screenshot_enabled = True
+        self.screenshot_rect = None
+        self.screenshot_interval = 5
+        self.screenshot_dir = SNAP_DIR
+        self.last_screenshot_time = 0.0
+        self.refresh_combo()
+        self.pos_label.setText("-")
+        self.screenshot_region_label.setText("尚未设置（未设置时不截图）")
+        self.update_screenshot_form()
+        self.auto_save_config()
+        self.save_screenshot_config()
+        self.update_region_overlay()
+        self.preview_label.clear()
+        self.preview_label.setText("等待开始监控……")
+        self.config_info.setText("已恢复默认配置。")
 
     def add_region(self, points):
         r = Region({
