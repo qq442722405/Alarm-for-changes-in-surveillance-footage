@@ -12,23 +12,19 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
       - name: Install dependencies
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-
       - name: Build EXE
         shell: pwsh
         run: |
-          pyinstaller --noconfirm --clean --windowed --onefile --icon=app.ico --name "监控变化报警" main.py
-
+          pyinstaller --noconfirm --clean --windowed --onefile --icon=app.ico --add-data "yolo11n.pt;." --name "监控变化报警" main.py
       - name: Prepare release
         shell: pwsh
         run: |
@@ -36,7 +32,6 @@ jobs:
           Copy-Item "dist/监控变化报警.exe" "release/监控变化报警.exe"
           Copy-Item "README.md" "release/README.md"
           Compress-Archive -Path "release/*" -DestinationPath "监控变化报警-Windows.zip" -Force
-
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
